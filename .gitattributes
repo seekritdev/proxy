@@ -1,0 +1,3 @@
+# Keep the Rust crate LF everywhere so rustfmt output is byte-identical across
+# Linux, macOS, and Windows checkouts.
+* text=auto eol=lf

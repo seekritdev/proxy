@@ -1,0 +1,434 @@
+{
+  "token": "skt_6EYgmoh8LuiPPAbM0SaVtc_MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgra6e_i8D2dIWlz-43EVbrHz-g698-kxY22MCp95L7VGhRANCAATA4nkyQKLq4hD5YvzXLtNtKAK_g-H4LF260zk0bInSWMbDfx0vTTtOg0tRWoDYWbuIN0vb1YMZ5z13xH5aBsDx",
+  "tokenId": "skt_6EYgmoh8LuiPPAbM0SaVtc",
+  "publicKeyJwk": "{\"key_ops\":[],\"ext\":true,\"kty\":\"EC\",\"x\":\"wOJ5MkCi6uIQ-WL81y7TbSgCv4Ph-CxdutM5NGyJ0lg\",\"y\":\"xsN_HS9NO06DS1FagNhZu4g3S9vVgxnnPXfEfloGwPE\",\"crv\":\"P-256\"}",
+  "resolve": {
+    "scope": {
+      "orgId": "org_test",
+      "orgSlug": "acme",
+      "appId": "app_test",
+      "appSlug": "web",
+      "envId": "env_apptest0000000000001",
+      "envSlug": "production"
+    },
+    "layers": [
+      {
+        "source": "group",
+        "environmentId": "env_grouptest0000000001",
+        "slug": "production",
+        "groupSlug": "shared",
+        "wrappedDek": "wd1.BGAAVA2nxO1UzcRZA_7ubZ9nLAGSf_Fc_6y07AHlv4N_q8dhQ0z4dwMHqUUaKPkkSnH8rnWkjnitlKHRmuIvoz8.dJ0ALJ9Wejh6nYiKM3adOA.VFgZWwqtT_ly6gP4.RIcWNi6id_QO9NtmCU4iFUEX9U9fUlqn2UNgmkgunpU_eVnKgMf6q8ui1PxcEBiw",
+        "secrets": [
+          {
+            "name": "SHARED",
+            "ciphertext": "sc1.oIjnQEJskdJ_nweV.MGETgRWPDkwhHm9e_jp567-b19Fn8DJohrU"
+          },
+          {
+            "name": "DATABASE_URL",
+            "ciphertext": "sc1.Fo69NaVLlUDFtGsk.tr8o0e7mMSB7DWkfZuv0eLOsNq7Fm-3dd2zOiPSXSHiwXbg"
+          },
+          {
+            "name": "UNICODE",
+            "ciphertext": "sc1.hu_o1qPHzmeJrT0q.5jIWUj9fTvGXjyeSyhtOMdvlWRenXqNy9F2uYg3XVgui0CYmdA"
+          }
+        ]
+      },
+      {
+        "source": "app",
+        "environmentId": "env_apptest0000000000001",
+        "slug": "production",
+        "wrappedDek": "wd1.BHVKzCsJECbpyULjVjFe-vw5mmKEJ26MZz02wc1RfzgozIRx9CrCFJJ0RkYWT_iuvAAG2rN7WNg5uNt0RQ6X14Q.Wfuvupy_B16u453L04UpSA.YPq62FodkXeezDd3.HgXwlx5gZRAnqmyk0WSz4HW9qVrb-DfEsvD76HKXkgigAShwBJ9g1qiVtSUgUgCo",
+        "secrets": [
+          {
+            "name": "SHARED",
+            "ciphertext": "sc1.hVO-Xgq16bV52VDQ.gePrTLVlrjIINJCs_gomYWnwqS4sD1CP"
+          },
+          {
+            "name": "API_KEY",
+            "ciphertext": "sc1.KpB-GlAGsWiNUN5p.PY5HnW1tOA-ZCBSSslnqFld4sPGWLujiW_j8gQ"
+          },
+          {
+            "name": "EMPTY",
+            "ciphertext": "sc1.qR6EjHPQkz6mZI37.PKrdRmvhq-N5bqYwWaK5Dg"
+          },
+          {
+            "name": "REFERENCING",
+            "ciphertext": "sc1.mc6E1roINLiI5H5U.jkSlIFcn3NxJLgStBEdpelOJ_aB9pouUIOu5YX7yIB0G_maOkBRA2UpFsFoXI1mRppEWwg"
+          },
+          {
+            "name": "ESCAPED_REF",
+            "ciphertext": "sc1.obgYCJstXaXFUJJg.tcI9_IOzvpSaXF96WPBowUKxph3dJ_7GvHs"
+          },
+          {
+            "name": "DANGLING_REF",
+            "ciphertext": "sc1.VJCnlvqadm3F6lge.kONf1u13yEIWc8pBjSs_XQDR9kmGi0wOTH35QE_QM8qJEhLuDg"
+          }
+        ]
+      }
+    ]
+  },
+  "expectedManagedValues": {
+    "SHARED": "from-app",
+    "DATABASE_URL": "postgres://group/db",
+    "UNICODE": "héllo-🌍-\n-tab\tend",
+    "API_KEY": "sk-app-12345",
+    "EMPTY": "",
+    "REFERENCING": "url=postgres://group/db;shared=from-app",
+    "ESCAPED_REF": "${SHARED}",
+    "DANGLING_REF": "build-${NOT_A_SECRET}"
+  },
+  "interpolation": {
+    "cases": [
+      {
+        "name": "substitutes a reference",
+        "input": {
+          "HOST": "db.internal",
+          "URL": "postgres://app@${HOST}:5432/db"
+        },
+        "expected": {
+          "HOST": "db.internal",
+          "URL": "postgres://app@db.internal:5432/db"
+        },
+        "unresolved": []
+      },
+      {
+        "name": "expands recursively, repeats, and forward references",
+        "input": {
+          "ADDR": "${HOST}:${PORT}",
+          "HOST": "db.internal",
+          "PORT": "5432",
+          "PAIR": "${ADDR}|${ADDR}"
+        },
+        "expected": {
+          "ADDR": "db.internal:5432",
+          "HOST": "db.internal",
+          "PORT": "5432",
+          "PAIR": "db.internal:5432|db.internal:5432"
+        },
+        "unresolved": []
+      },
+      {
+        "name": "leaves unknown references literal and reports them",
+        "input": {
+          "TAG": "build-${GITHUB_SHA}",
+          "OTHER": "${NOPE}-${GITHUB_SHA}"
+        },
+        "expected": {
+          "TAG": "build-${GITHUB_SHA}",
+          "OTHER": "${NOPE}-${GITHUB_SHA}"
+        },
+        "unresolved": [
+          "GITHUB_SHA",
+          "NOPE"
+        ]
+      },
+      {
+        "name": "expands around an unknown reference",
+        "input": {
+          "HOST": "db.internal",
+          "URL": "${HOST}/${MISSING}"
+        },
+        "expected": {
+          "HOST": "db.internal",
+          "URL": "db.internal/${MISSING}"
+        },
+        "unresolved": [
+          "MISSING"
+        ]
+      },
+      {
+        "name": "$${NAME} escapes to a literal ${NAME}",
+        "input": {
+          "NAME": "expanded",
+          "TEMPLATE": "$${NAME} stays, ${NAME} goes"
+        },
+        "expected": {
+          "NAME": "expanded",
+          "TEMPLATE": "${NAME} stays, expanded goes"
+        },
+        "unresolved": []
+      },
+      {
+        "name": "leaves shell-style, non-name, and unterminated forms alone",
+        "input": {
+          "FOO": "value",
+          "DEFAULTED": "${FOO:-fallback}",
+          "POSITIONAL": "${1}",
+          "DOTTED": "${a.b}",
+          "EMPTY_REF": "${}",
+          "UNTERMINATED": "${FOO",
+          "PASSWORD": "p$$w0rd$"
+        },
+        "expected": {
+          "FOO": "value",
+          "DEFAULTED": "${FOO:-fallback}",
+          "POSITIONAL": "${1}",
+          "DOTTED": "${a.b}",
+          "EMPTY_REF": "${}",
+          "UNTERMINATED": "${FOO",
+          "PASSWORD": "p$$w0rd$"
+        },
+        "unresolved": []
+      },
+      {
+        "name": "recognizes a reference after an unterminated one",
+        "input": {
+          "A": "a",
+          "T": "${ ${A}"
+        },
+        "expected": {
+          "A": "a",
+          "T": "${ a"
+        },
+        "unresolved": []
+      },
+      {
+        "name": "handles empty values and multibyte text",
+        "input": {
+          "EMPTY": "",
+          "A": "héllo-🌍",
+          "T": "🌍${A}${EMPTY}🌍"
+        },
+        "expected": {
+          "EMPTY": "",
+          "A": "héllo-🌍",
+          "T": "🌍héllo-🌍🌍"
+        },
+        "unresolved": []
+      },
+      {
+        "name": "a diamond is not a cycle",
+        "input": {
+          "BASE": "b",
+          "LEFT": "${BASE}-l",
+          "RIGHT": "${BASE}-r",
+          "TOP": "${LEFT}+${RIGHT}"
+        },
+        "expected": {
+          "BASE": "b",
+          "LEFT": "b-l",
+          "RIGHT": "b-r",
+          "TOP": "b-l+b-r"
+        },
+        "unresolved": []
+      }
+    ],
+    "cycles": [
+      {
+        "name": "self reference",
+        "input": {
+          "A": "x${A}"
+        }
+      },
+      {
+        "name": "direct cycle",
+        "input": {
+          "A": "${B}",
+          "B": "${A}"
+        }
+      },
+      {
+        "name": "indirect cycle",
+        "input": {
+          "A": "${B}",
+          "B": "${C}",
+          "C": "${A}"
+        }
+      }
+    ]
+  },
+  "substitution": {
+    "note": "Placeholder substitution over plaintext alone — no crypto involved. Every implementation of the engine (apps/proxy/src/substitute.rs and the fetch/httpx shims in the language SDKs) runs these, so the rules can never drift apart. The lookup each harness must install: a name in `denied` returns Denied, otherwise a name present in `values` returns that Value, otherwise Unknown. A case has either `expected` + `names`, or `error`.",
+    "cases": [
+      {
+        "name": "substitutes a placeholder and reports the name",
+        "input": "Bearer {{seekrit:OPENAI_API_KEY}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "Bearer sk-live",
+        "names": [
+          "OPENAI_API_KEY"
+        ]
+      },
+      {
+        "name": "passes text with no placeholder through untouched",
+        "input": "nothing to see here",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "nothing to see here",
+        "names": []
+      },
+      {
+        "name": "repeats one name as many times as it appears",
+        "input": "{{seekrit:OPENAI_API_KEY}}::{{seekrit:OPENAI_API_KEY}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "sk-live::sk-live",
+        "names": [
+          "OPENAI_API_KEY"
+        ]
+      },
+      {
+        "name": "reports two injected names, sorted",
+        "input": "{\"a\":\"{{seekrit:STRIPE_KEY}}\",\"b\":\"{{seekrit:OPENAI_API_KEY}}\"}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live",
+          "STRIPE_KEY": "sk_test_1"
+        },
+        "denied": [],
+        "expected": "{\"a\":\"sk_test_1\",\"b\":\"sk-live\"}",
+        "names": [
+          "OPENAI_API_KEY",
+          "STRIPE_KEY"
+        ]
+      },
+      {
+        "name": "a denied name aborts the pass",
+        "input": "{{seekrit:SOME_OTHER}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [
+          "SOME_OTHER"
+        ],
+        "error": {
+          "code": "denied",
+          "name": "SOME_OTHER"
+        }
+      },
+      {
+        "name": "an allowed but unresolved name aborts the pass",
+        "input": "{{seekrit:MISSING}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "error": {
+          "code": "unresolved",
+          "name": "MISSING"
+        }
+      },
+      {
+        "name": "a denial wins even when a valid placeholder came first",
+        "input": "{{seekrit:OPENAI_API_KEY}} then {{seekrit:SOME_OTHER}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [
+          "SOME_OTHER"
+        ],
+        "error": {
+          "code": "denied",
+          "name": "SOME_OTHER"
+        }
+      },
+      {
+        "name": "an unterminated marker is literal",
+        "input": "value {{seekrit:OPENAI_API_KEY",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "value {{seekrit:OPENAI_API_KEY",
+        "names": []
+      },
+      {
+        "name": "an illegal character in the name makes the marker literal",
+        "input": "{{seekrit:bad-name}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "{{seekrit:bad-name}}",
+        "names": []
+      },
+      {
+        "name": "an empty name is not a placeholder",
+        "input": "{{seekrit:}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "{{seekrit:}}",
+        "names": []
+      },
+      {
+        "name": "whitespace inside the marker is not a placeholder",
+        "input": "{{ seekrit:OPENAI_API_KEY }}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "{{ seekrit:OPENAI_API_KEY }}",
+        "names": []
+      },
+      {
+        "name": "nesting is not expanded recursively",
+        "input": "{{seekrit:{{seekrit:OPENAI_API_KEY}}}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "{{seekrit:sk-live}}",
+        "names": [
+          "OPENAI_API_KEY"
+        ]
+      },
+      {
+        "name": "a substituted value is never rescanned",
+        "input": "{{seekrit:OPENAI_API_KEY}}",
+        "values": {
+          "OPENAI_API_KEY": "{{seekrit:STRIPE_KEY}}",
+          "STRIPE_KEY": "sk_test_1"
+        },
+        "denied": [],
+        "expected": "{{seekrit:STRIPE_KEY}}",
+        "names": [
+          "OPENAI_API_KEY"
+        ]
+      },
+      {
+        "name": "extra closing braces stay literal",
+        "input": "{{seekrit:OPENAI_API_KEY}}}}",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "sk-live}}",
+        "names": [
+          "OPENAI_API_KEY"
+        ]
+      },
+      {
+        "name": "multibyte text around a placeholder survives",
+        "input": "🌍 {{seekrit:OPENAI_API_KEY}} héllo",
+        "values": {
+          "OPENAI_API_KEY": "sk-live"
+        },
+        "denied": [],
+        "expected": "🌍 sk-live héllo",
+        "names": [
+          "OPENAI_API_KEY"
+        ]
+      },
+      {
+        "name": "an empty value substitutes to nothing",
+        "input": "[{{seekrit:EMPTY}}]",
+        "values": {
+          "EMPTY": ""
+        },
+        "denied": [],
+        "expected": "[]",
+        "names": [
+          "EMPTY"
+        ]
+      }
+    ]
+  }
+}

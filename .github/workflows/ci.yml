@@ -1,0 +1,64 @@
+# CI for this mirror: fmt, clippy, the full test suite, and the container image.
+#
+# This is the check that matters most for a mirror, because it runs against the
+# repo as a *cloner* sees it — vendored crates, rewritten dependency paths and
+# all. The monorepo's own proxy CI cannot catch a broken vendoring step, since
+# nothing is vendored there.
+#
+# Two of these jobs are load-bearing beyond the usual:
+#   * `--locked` proves the committed Cargo.lock still resolves after the sync
+#     rewrites Cargo.toml's dependency paths.
+#   * the substitution-vector test asserts against testdata/run-vectors.json,
+#     a copy of the shared golden fixture that pins this proxy's placeholder
+#     substitution to the language SDKs'. A sync that forgets to copy it fails
+#     to compile rather than silently skipping.
+#
+# Nothing here publishes. This file is overwritten on each sync.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: docker/setup-buildx-action@v3
+      # Build only — publishing the image stays in the monorepo
+      # (publish-proxy-image.yml), which is unaffected by this mirror.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

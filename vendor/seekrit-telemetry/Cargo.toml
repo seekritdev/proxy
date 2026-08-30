@@ -1,0 +1,80 @@
+[package]
+name = "seekrit-telemetry"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Shared OpenTelemetry wiring for the seekrit services customers run on their own infrastructure (run, proxy, provisioner, sdk-server, kms). OTLP/HTTP traces, metrics, and logs, configured entirely through the standard OTEL_* environment variables and inert until one is set."
+license = "MIT"
+repository = "https://github.com/seekritdev/proxy"
+publish = false
+
+[lib]
+name = "seekrit_telemetry"
+path = "src/lib.rs"
+
+[features]
+# On by default: a released binary is observable out of the box (and still
+# exports nothing until an endpoint is configured). `--no-default-features`
+# compiles the whole OpenTelemetry stack out for size-sensitive builds — see
+# the size table in the crate docs.
+default = ["otel"]
+otel = [
+  "dep:opentelemetry_sdk",
+  "dep:opentelemetry-otlp",
+  "dep:opentelemetry-http",
+  "dep:opentelemetry-appender-tracing",
+  "dep:tracing-opentelemetry",
+  "dep:async-trait",
+  "dep:bytes",
+  "dep:ureq",
+]
+# Span-capture harness for the per-service leak tests. Never enabled in a
+# release build; consumers turn it on as a dev-dependency feature.
+testing = ["otel", "opentelemetry_sdk/testing"]
+
+[dependencies]
+# Always present: every consumer logs, with or without OTLP export.
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "registry"] }
+
+# The OpenTelemetry **API** is always linked; only the SDK and exporters are
+# optional. That is what makes `--no-default-features` a drop-in: instruments
+# and propagators still typecheck, and with no provider installed the API's own
+# no-op implementations make every call free. Consumers therefore never need a
+# `cfg` around their instrumentation.
+opentelemetry = { version = "0.32", default-features = false, features = [
+  "trace",
+  "metrics",
+  "logs",
+] }
+# Header types for context propagation, needed in both modes.
+http = "1"
+
+# --- OpenTelemetry, all optional behind `otel` ------------------------------
+# http-proto only: OTLP over HTTP/protobuf. `grpc-tonic` would pull tonic +
+# hyper's server stack, and the default `reqwest-blocking-client` would link a
+# second reqwest major (opentelemetry-http 0.32 targets reqwest 0.13 while the
+# services are on 0.12). We bring our own client instead — see client.rs.
+opentelemetry_sdk = { version = "0.32", default-features = false, features = [
+  "trace",
+  "metrics",
+  "logs",
+], optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+  "trace",
+  "metrics",
+  "logs",
+  "http-proto",
+], optional = true }
+opentelemetry-http = { version = "0.32", default-features = false, optional = true }
+opentelemetry-appender-tracing = { version = "0.32", default-features = false, optional = true }
+tracing-opentelemetry = { version = "0.33", default-features = false, optional = true }
+
+# The exporter's HTTP client. Blocking on purpose (see client.rs) and rustls +
+# bundled roots, so the `scratch` images keep working with no system CA store.
+ureq = { version = "2", default-features = false, features = [
+  "tls",
+], optional = true }
+
+async-trait = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }

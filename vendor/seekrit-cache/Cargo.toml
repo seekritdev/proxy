@@ -1,0 +1,22 @@
+[package]
+name = "seekrit-cache"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Opt-in last-known-good cache for seekrit machine clients: persists the /v1/resolve response (ciphertext + wrapped DEKs, never plaintext) so a workload can still boot while the API is unreachable."
+license = "MIT"
+repository = "https://github.com/seekritdev/proxy"
+publish = false
+
+[lib]
+name = "seekrit_cache"
+path = "src/lib.rs"
+
+[dependencies]
+# Cache keys and the token fingerprint. Same SHA-256 the core crypto uses.
+sha2 = "0.10"
+
+# The on-disk envelope. The cached body itself stays an opaque string, so this
+# crate never needs the resolve types (and never parses ciphertext).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

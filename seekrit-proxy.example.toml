@@ -1,0 +1,169 @@
+# seekrit-proxy configuration.
+#
+# The proxy resolves the secrets its service token grants (SEEKRIT_TOKEN in the
+# environment, never in this file), then swaps {{seekrit:NAME}} placeholders in
+# outbound requests for the decrypted values before forwarding upstream.
+#
+# There are two modes; configure either or both (on different ports):
+#   * Reverse proxy ([[route]]) — the workload points its base URL at the proxy.
+#     Simplest; no certificate setup.
+#   * Forward proxy ([forward]) — the workload sets HTTPS_PROXY and trusts the
+#     proxy's CA. Transparent to any client; intercepts TLS for ruled hosts.
+#
+# The allowlist is the security boundary in both modes: a secret can only ever
+# reach the upstream(s)/host(s) listed here (default-deny), so a compromised or
+# curious agent cannot redirect a real key to an attacker.
+#
+# Rules may also bound the *operations* an agent may perform on an upstream
+# (`methods`, `paths`), and can come from the dashboard instead of this file
+# ([policy] source = "server") — see the two blocks at the end.
+
+# ---------------------------------------------------------------------------
+# Reverse proxy: each [[route]] maps a path prefix to an upstream.
+# ---------------------------------------------------------------------------
+
+# Bind to loopback so only workloads on this host/sidecar can reach the proxy.
+listen = "127.0.0.1:8080"
+
+# Add W3C traceparent/tracestate to the requests forwarded upstream.
+#
+# Off by default. The proxy continues the *caller's* trace either way (that
+# needs no configuration); this controls only what the upstream receives. Most
+# upstreams here are third-party APIs you don't operate, where propagation buys
+# nothing and just hands an outside party a correlatable id. Turn it on when the
+# upstream is your own instrumented service.
+#
+# Export itself is configured with the standard OTEL_* environment variables —
+# see https://seekrit.dev/docs/guides/telemetry
+# propagate_trace_upstream = true
+
+# Request bodies are buffered to substitute placeholders, so they are capped.
+# Default is 2 MiB; raise it only if an API takes placeholders in large bodies.
+# max_request_body_bytes = 2097152
+
+[[route]]
+prefix = "/example"
+upstream = "https://api.example.com"
+allow = ["EXAMPLE_API_KEY"]
+# Optional operation constraints. Both default to "any", so omitting them keeps
+# the historical behaviour; adding them turns the allowlist from anti-theft into
+# anti-misuse — an agent with a legitimate key still cannot reach an operation
+# you did not grant. Paths are matched against the path *after* the prefix is
+# stripped: `*` matches within one segment, `**` across them.
+# methods = ["POST"]
+# paths = ["/v1/chat/completions", "/v1/embeddings"]
+# label = "chat completions"          # shown in refusal logs and the simulator
+
+# Point the agent's SDK base URL at http://127.0.0.1:8080/example and send the
+# credential as a placeholder, e.g.:
+#     Authorization: Bearer {{seekrit:EXAMPLE_API_KEY}}
+# The proxy forwards to https://api.example.com/... with the real key filled in.
+
+# [[route]]
+# prefix = "/internal"
+# upstream = "https://internal.corp.example"
+# allow = ["INTERNAL_TOKEN", "INTERNAL_SIGNING_KEY"]
+
+# ---------------------------------------------------------------------------
+# Forward proxy + TLS interception (HTTPS_PROXY model).
+#
+# The workload sets HTTPS_PROXY=http://127.0.0.1:8081 and trusts the CA below.
+# For each ruled host the proxy terminates TLS with a cert it mints (so it can
+# read the request), substitutes {{seekrit:NAME}}, and re-originates TLS to the
+# real host. Hosts with no rule follow `unmatched_host_policy`.
+# ---------------------------------------------------------------------------
+
+# [forward]
+# listen = "127.0.0.1:8081"
+#
+# # What to do with a host that has no rule below:
+# #   "tunnel" (default) — blind-pipe it through untouched (no interception, no
+# #                        injection) so the workload's other traffic still works.
+# #   "deny"             — refuse it (403). Strict: only ruled hosts are reachable.
+# unmatched_host_policy = "tunnel"
+#
+# # The interception CA. Generated + persisted on first run if absent; install
+# # ca_cert into the workload's trust store (e.g. NODE_EXTRA_CA_CERTS,
+# # SSL_CERT_FILE, REQUESTS_CA_BUNDLE, or the system store).
+# ca_cert = "seekrit-proxy-ca.pem"
+# ca_key = "seekrit-proxy-ca-key.pem"
+#
+# [[forward.host]]
+# match = "api.example.com"          # bare hostname, no scheme/port/path
+# allow = ["EXAMPLE_API_KEY"]         # secrets injectable toward this host
+# methods = ["POST"]                  # optional; absent = any method
+# paths = ["/v1/**"]                  # optional; absent = any path
+#
+# # Several rules may name one host — they are checked in order, first match
+# # wins, so a narrow rule belongs above a broad one:
+# [[forward.host]]
+# match = "api.example.com"
+# methods = ["GET"]                   # reads are fine, but carry no credential
+
+# ---------------------------------------------------------------------------
+# Where the rules come from.
+#
+# "file" (the default) is this file: authorization with no network dependency,
+# and a file seekrit cannot change. Kept supported indefinitely.
+#
+# "server" takes the rules from agent access policy in the dashboard, so adding
+# an upstream is a UI change rather than a redeploy. The bundle is signed in the
+# publishing admin's browser, and this proxy refuses any bundle not signed by a
+# key whose thumbprint is pinned below — so seekrit can withhold your policy
+# (the proxy then fails closed) but cannot widen it.
+#
+# In server mode, `allow`/`methods`/`paths` above are rejected rather than
+# silently ignored, and the forward proxy's intercepted hosts come from the
+# published policy. Secrets are also re-resolved on the same interval, so a new
+# rule and the credential it names arrive together.
+# ---------------------------------------------------------------------------
+
+# [policy]
+# source = "server"
+# agent = "nova"                      # the agent identity this deployment is
+# agents = ["nova", "scribe"]         # every identity it may serve (see [control])
+# refresh_interval = "10s"            # how soon a published change lands here
+#
+# # THE TRUST ANCHOR. The one thing that must not come from the server — copy it
+# # from the dashboard's trust-anchor panel and commit it. Pin a second admin's
+# # thumbprint too, or one lost passphrase means nobody can publish.
+# signers = ["kNc8…thumbprint"]
+#
+# # Optional fleet ceiling: server policy may only narrow this, and a bundle that
+# # exceeds it is refused wholesale. Off by default, and inappropriate for
+# # interactive development — there the adversary is the local agent, which can
+# # edit local files anyway, so a ceiling adds no security and puts every new
+# # upstream back into a TOML edit.
+# [[policy.ceiling]]
+# host = "api.example.com"
+# allow = ["EXAMPLE_API_KEY"]
+
+# ---------------------------------------------------------------------------
+# Session tickets, when one proxy fronts several agents with different reach.
+#
+# The orchestrator (trusted) POSTs /session to mint a ticket naming an agent
+# identity and, optionally, a narrower set of secrets; the agent receives only
+# the opaque ticket and presents it in `x-seekrit-ticket`. Scopes can only ever
+# narrow — the effective set is the ticket's ∩ the published policy's.
+#
+# Requires SEEKRIT_PROXY_CONTROL_TOKEN in the environment (never this file), and
+# that token must not be readable by the agent: without it any local process
+# could mint itself a ticket for any identity.
+# ---------------------------------------------------------------------------
+
+# [control]
+# listen = "127.0.0.1:9090"
+# ttl = "1h"                          # default ticket lifetime
+# max_ttl = "12h"                     # the longest it will mint
+
+# ---------------------------------------------------------------------------
+# Periodic re-resolve (file policy only — server mode turns it on implicitly).
+#
+# The proxy otherwise resolves once at startup and never again, so a credential
+# added later never reaches a healthy running proxy. No new grant is involved: a
+# new secret in an environment this proxy already has a key grant for decrypts
+# with the key it already holds.
+# ---------------------------------------------------------------------------
+
+# [secrets]
+# refresh_interval = "30s"

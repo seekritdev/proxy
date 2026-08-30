@@ -1,0 +1,101 @@
+[package]
+name = "seekrit-proxy"
+version = "0.10.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Egress proxy that swaps {{seekrit:NAME}} placeholders in outbound requests for decrypted secrets, so an (untrusted) agent never holds the plaintext. Zero-knowledge: decryption happens locally, gated by a per-upstream allowlist."
+license = "MIT"
+repository = "https://github.com/seekritdev/proxy"
+publish = false
+
+[[bin]]
+name = "seekrit-proxy"
+path = "src/main.rs"
+
+[lib]
+name = "seekrit_proxy"
+path = "src/lib.rs"
+
+[features]
+# Telemetry is on by default: a released binary is observable out of the box and
+# still exports nothing until an OTEL_EXPORTER_OTLP_* endpoint is configured.
+# Build with `--no-default-features` to compile the OpenTelemetry stack out
+# entirely for a smaller binary; instrumentation call sites stay put and become
+# no-ops.
+default = ["otel"]
+otel = ["seekrit-telemetry/otel"]
+
+[dependencies]
+# Shared, transport-free zero-knowledge core (token key, DEK unwrap, decrypt).
+seekrit-core = { path = "vendor/seekrit-core" }
+
+# Shared OpenTelemetry wiring (OTLP/HTTP traces, metrics, logs) + the tracing
+# subscriber. Inert until an OTEL_EXPORTER_OTLP_* endpoint is configured.
+seekrit-telemetry = { path = "vendor/seekrit-telemetry", default-features = false }
+
+# Opt-in last-known-good cache ([cache] in the config file): lets the proxy
+# start during a seekrit outage instead of refusing to.
+seekrit-cache = { path = "vendor/seekrit-cache" }
+
+# Lock-free snapshot swap: a proxy that started from the cache upgrades itself
+# to live secrets mid-flight, without blocking in-flight requests. Also carries
+# each agent's current policy snapshot (see src/policy.rs).
+arc-swap = "1"
+
+# CSPRNG for session-ticket minting (src/tickets.rs). Pure, tiny, and the same
+# OS source rustls/rcgen already draw from.
+getrandom = "0.2"
+
+# Async HTTP server (data plane) + client (upstream + startup resolve).
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "net",
+  "signal",
+  "io-util",
+  "sync",
+] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "stream",
+  "http2",
+] }
+
+# Forward-proxy (HTTPS_PROXY / CONNECT) data plane: low-level hyper to hijack
+# CONNECT and serve HTTP over the MITM'd TLS stream, rustls to terminate it, and
+# rcgen to mint per-host leaf certs from a local CA.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+futures-util = "0.3"
+bytes = "1"
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rcgen = "0.13"
+
+# Config (TOML) + resolve response deserialization.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Observability + secret hygiene. The subscriber itself is installed by
+# seekrit-telemetry, so only the facade is needed here.
+tracing = "0.1"
+zeroize = "1"
+
+[dev-dependencies]
+# Span-capture harness for the zero-knowledge leak test (tests/telemetry.rs).
+seekrit-telemetry = { path = "vendor/seekrit-telemetry", features = ["testing"] }
+# Tests exercise the proxy over real HTTP; `json` decodes the mock upstream's
+# echo response.
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true

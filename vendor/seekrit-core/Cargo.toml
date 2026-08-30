@@ -1,0 +1,32 @@
+[package]
+name = "seekrit-core"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+description = "Shared, transport-free zero-knowledge primitives for seekrit clients: service-token key recovery, DEK unwrap, secret decryption, and the /v1/resolve response types. Bit-compatible with @seekrit/crypto (WebCrypto)."
+license = "MIT"
+repository = "https://github.com/seekritdev/proxy"
+publish = false
+
+[lib]
+name = "seekrit_core"
+path = "src/lib.rs"
+
+[dependencies]
+# Crypto: audited, pure-Rust RustCrypto stack (no OpenSSL, no C). Mirrors exactly
+# what the browser/CLI do via WebCrypto: ECDH P-256 -> HKDF-SHA256 -> AES-256-GCM,
+# plus ECDSA P-256 (SHA-256) for KMS `sign` keys.
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pkcs8"] }
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = "1"
+# CSPRNG for KMS encrypt (random IVs) and GenerateDataKey (random data keys).
+# Decrypt-only consumers never call these paths; the dep is tiny and pure.
+getrandom = "0.2"
+
+# Deserialization of the resolve response (transport lives in the consuming app).
+serde = { version = "1", features = ["derive"] }
+# Policy bundles are parsed here (the signature covers the transported bytes, so
+# the verifier must read the very JSON it verified).
+serde_json = "1"
