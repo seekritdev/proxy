@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.10.2](https://github.com/mileszim/seekrit/compare/proxy-v0.10.1...proxy-v0.10.2) (2026-09-09)
+
+
+### Dependencies
+
+* **deps:** bump getrandom from 0.2.17 to 0.4.3 in /apps/proxy ([#335](https://github.com/mileszim/seekrit/issues/335)) ([fe79448](https://github.com/mileszim/seekrit/commit/fe794488b4e439822d48925c077c98f22157af6b))
+* **deps:** bump sha2 from 0.10.9 to 0.11.0 in /crates/seekrit-cache ([#366](https://github.com/mileszim/seekrit/issues/366)) ([214a83a](https://github.com/mileszim/seekrit/commit/214a83a5223e3061b41fb58b120de7e7f9c0191f))
+* **deps:** bump sha2 from 0.10.9 to 0.11.0 in /crates/seekrit-core ([#367](https://github.com/mileszim/seekrit/issues/367)) ([24ae136](https://github.com/mileszim/seekrit/commit/24ae136559a3f60eddc31d5797cb3ab64a8c8742))
+
 ## [0.10.1](https://github.com/mileszim/seekrit/compare/proxy-v0.10.0...proxy-v0.10.1) (2026-09-09)
 
 
