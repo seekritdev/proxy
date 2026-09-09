@@ -166,7 +166,7 @@ fn random_ticket() -> String {
     let mut bytes = [0u8; 32];
     // The proxy already depends on a CSPRNG through rustls/rcgen; this uses the
     // same OS source.
-    getrandom::getrandom(&mut bytes).expect("OS randomness");
+    getrandom::fill(&mut bytes).expect("OS randomness");
     format!("skp_{}", seekrit_core::b64::encode(&bytes))
 }
 

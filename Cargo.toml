@@ -44,7 +44,7 @@ arc-swap = "1"
 
 # CSPRNG for session-ticket minting (src/tickets.rs). Pure, tiny, and the same
 # OS source rustls/rcgen already draw from.
-getrandom = "0.2"
+getrandom = "0.4"
 
 # Async HTTP server (data plane) + client (upstream + startup resolve).
 tokio = { version = "1", features = [
