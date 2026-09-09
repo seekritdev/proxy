@@ -1,6 +1,6 @@
 [package]
 name = "seekrit-proxy"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2021"
 rust-version = "1.88"
 description = "Egress proxy that swaps {{seekrit:NAME}} placeholders in outbound requests for decrypted secrets, so an (untrusted) agent never holds the plaintext. Zero-knowledge: decryption happens locally, gated by a per-upstream allowlist."
