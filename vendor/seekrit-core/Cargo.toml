@@ -18,8 +18,8 @@ path = "src/lib.rs"
 # plus ECDSA P-256 (SHA-256) for KMS `sign` keys.
 p256 = { version = "0.14", features = ["ecdh", "ecdsa", "pkcs8"] }
 aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
-hkdf = "0.12"
-sha2 = "0.10"
+hkdf = "0.13"
+sha2 = "0.11"
 zeroize = "1"
 # CSPRNG for KMS encrypt (random IVs) and GenerateDataKey (random data keys).
 # Decrypt-only consumers never call these paths; the dep is tiny and pure.
