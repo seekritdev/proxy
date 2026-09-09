@@ -84,7 +84,7 @@ pub fn blob_key_ref(blob: &str) -> CoreResult<KmsKeyRef> {
 
 fn random_bytes(n: usize) -> CoreResult<Zeroizing<Vec<u8>>> {
     let mut buf = Zeroizing::new(vec![0u8; n]);
-    getrandom::getrandom(&mut buf)
+    getrandom::fill(&mut buf)
         .map_err(|e| CoreError::Crypto(format!("secure RNG unavailable: {e}")))?;
     Ok(buf)
 }

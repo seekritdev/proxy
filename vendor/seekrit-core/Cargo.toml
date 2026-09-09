@@ -23,7 +23,7 @@ sha2 = "0.10"
 zeroize = "1"
 # CSPRNG for KMS encrypt (random IVs) and GenerateDataKey (random data keys).
 # Decrypt-only consumers never call these paths; the dep is tiny and pure.
-getrandom = "0.2"
+getrandom = "0.4"
 
 # Deserialization of the resolve response (transport lives in the consuming app).
 serde = { version = "1", features = ["derive"] }
