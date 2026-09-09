@@ -14,7 +14,7 @@ path = "src/lib.rs"
 
 [dependencies]
 # Cache keys and the token fingerprint. Same SHA-256 the core crypto uses.
-sha2 = "0.10"
+sha2 = "0.11"
 
 # The on-disk envelope. The cached body itself stays an opaque string, so this
 # crate never needs the resolve types (and never parses ciphertext).
