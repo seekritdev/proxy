@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/mileszim/seekrit/compare/proxy-v0.11.0...proxy-v0.12.0) (2026-09-13)
+
+
+### Features
+
+* **proxy:** attest which program is using the control listener ([#391](https://github.com/mileszim/seekrit/issues/391)) ([f9fb07a](https://github.com/mileszim/seekrit/commit/f9fb07a3a16854fba104471498167e8dcd72efec))
+
 ## [0.11.0](https://github.com/mileszim/seekrit/compare/proxy-v0.10.2...proxy-v0.11.0) (2026-09-13)
 
 
