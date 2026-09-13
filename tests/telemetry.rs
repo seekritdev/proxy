@@ -80,6 +80,7 @@ allow = ["{SECRET_NAME}"]
         sessions: std::sync::Arc::new(seekrit_proxy::tasks::SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     }
 }
 

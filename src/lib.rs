@@ -6,6 +6,7 @@
 //! data-plane paths can be exercised in tests (see `tests/proxy.rs`).
 
 pub mod activity;
+pub mod approval;
 pub mod ca;
 pub mod config;
 pub mod egress;

@@ -76,6 +76,7 @@ async fn forward_proxy(cfg: &str) -> String {
         sessions: Arc::new(SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -236,6 +237,7 @@ async fn a_configured_reverse_upstream_stays_reachable() {
         sessions: Arc::new(SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn(router(state)).await;
 

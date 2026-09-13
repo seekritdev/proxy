@@ -67,6 +67,7 @@ struct RawConfig {
     activity: Option<RawActivity>,
     redaction: Option<RawRedaction>,
     egress: Option<RawEgress>,
+    approval: Option<RawApproval>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -167,6 +168,23 @@ struct RawTasks {
 struct RawActivity {
     flush_interval: Option<String>,
     max_cells: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawApproval {
+    timeout: Option<String>,
+    #[serde(default)]
+    require: Vec<RawApprovalRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawApprovalRule {
+    host: String,
+    #[serde(default)]
+    methods: Vec<String>,
+    #[serde(default)]
+    paths: Vec<String>,
+    label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -279,6 +297,12 @@ pub struct Config {
     /// there — and the operator who most needs the check is the one who never
     /// read about it.
     pub egress: crate::egress::EgressConfig,
+    /// Operations that stop for a human before they are dispatched.
+    ///
+    /// Absent means none do. Opt-in, unlike `[redaction]` and `[egress]`: this
+    /// one *holds a live connection*, so turning it on for someone who did not
+    /// ask would convert working traffic into timeouts.
+    pub approval: Option<crate::approval::ApprovalConfig>,
 }
 
 /// The validated `[activity]` block.
@@ -456,6 +480,7 @@ pub enum ConfigError {
     Activity(String),
     Redaction(String),
     Egress(String),
+    Approval(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -475,6 +500,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Activity(m) => write!(f, "invalid [activity] config: {m}"),
             ConfigError::Redaction(m) => write!(f, "invalid [redaction] config: {m}"),
             ConfigError::Egress(m) => write!(f, "invalid [egress] config: {m}"),
+            ConfigError::Approval(m) => write!(f, "invalid [approval] config: {m}"),
         }
     }
 }
@@ -568,6 +594,7 @@ impl Config {
         let ratchet = raw.ratchet.map(validate_ratchet).transpose()?;
         let redaction = validate_redaction(raw.redaction)?;
         let egress = validate_egress(raw.egress)?;
+        let approval = raw.approval.map(validate_approval).transpose()?;
 
         Ok(Config {
             listen,
@@ -586,6 +613,7 @@ impl Config {
             activity,
             redaction,
             egress,
+            approval,
         })
     }
 
@@ -825,6 +853,63 @@ impl TasksConfig {
         }
         Ok(TasksConfig { cache_ttl })
     }
+}
+
+/// Validate `[approval]` into the trigger list `crate::approval` matches against.
+///
+/// Two things are refused rather than accepted quietly, because each produces a
+/// control that looks configured and is not:
+///
+/// - an empty `require` list, which arms a hold that can never fire;
+/// - a timeout outside [`MIN_TIMEOUT`]..[`MAX_TIMEOUT`] — too short and no human
+///   can answer, so every held request becomes a denial; too long and the held
+///   connection is a worse problem than the operation it is guarding.
+fn validate_approval(raw: RawApproval) -> Result<crate::approval::ApprovalConfig, ConfigError> {
+    use crate::approval::{ApprovalConfig, Trigger, DEFAULT_TIMEOUT, MAX_TIMEOUT, MIN_TIMEOUT};
+
+    if raw.require.is_empty() {
+        return Err(ConfigError::Approval(
+            "no [[approval.require]] blocks — nothing would ever stop for a human".into(),
+        ));
+    }
+
+    let timeout = duration(
+        raw.timeout,
+        DEFAULT_TIMEOUT,
+        "timeout",
+        ConfigError::Approval,
+    )?;
+    if timeout < MIN_TIMEOUT || timeout > MAX_TIMEOUT {
+        return Err(ConfigError::Approval(format!(
+            "timeout {}s is outside {}s..{}s — below that nobody can answer in time, so every \
+             held request becomes a denial; above it the held connection is the bigger problem",
+            timeout.as_secs(),
+            MIN_TIMEOUT.as_secs(),
+            MAX_TIMEOUT.as_secs()
+        )));
+    }
+
+    let mut require = Vec::with_capacity(raw.require.len());
+    for rule in raw.require {
+        let host = rule.host.trim().to_lowercase();
+        if host.is_empty() || host.contains('/') || host.contains(':') {
+            return Err(ConfigError::Approval(format!(
+                "approval host {:?} must be a bare hostname",
+                rule.host
+            )));
+        }
+        require.push(Trigger {
+            host,
+            methods: MethodSet::new(rule.methods),
+            paths: PathSet::new(rule.paths),
+            label: rule
+                .label
+                .map(|l| l.trim().to_string())
+                .filter(|l| !l.is_empty()),
+        });
+    }
+
+    Ok(ApprovalConfig { timeout, require })
 }
 
 /// Validate `[egress]` — or synthesise the enforcing default when it is absent.
@@ -1291,6 +1376,58 @@ mod tests {
         assert!(c.policy.signers.is_empty());
         assert!(c.secrets.refresh_interval.is_none());
         assert!(c.control.is_none());
+    }
+
+    #[test]
+    fn approval_is_absent_unless_asked_for() {
+        // Opt-in, unlike [redaction] and [egress]: this one holds a live
+        // connection, so defaulting it on would turn working traffic into
+        // timeouts for someone who never asked.
+        let c = cfg("[[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(c.approval.is_none());
+    }
+
+    #[test]
+    fn approval_parses_triggers_and_a_timeout() {
+        let c = cfg("[approval]\ntimeout='30s'\n\
+             [[approval.require]]\nhost='api.stripe.com'\nmethods=['POST']\npaths=['/v1/charges/**']\nlabel='money movement'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        let a = c.approval.expect("an [approval] block");
+        assert_eq!(a.timeout, std::time::Duration::from_secs(30));
+        assert_eq!(a.require.len(), 1);
+        assert_eq!(a.require[0].host, "api.stripe.com");
+        assert_eq!(a.require[0].label.as_deref(), Some("money movement"));
+    }
+
+    #[test]
+    fn an_approval_block_with_no_rules_is_refused() {
+        // It would arm a hold that can never fire, which reads as configured and
+        // is not.
+        let bad = err("[approval]\ntimeout='30s'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(bad.contains("nothing would ever stop"), "{bad}");
+    }
+
+    #[test]
+    fn an_unanswerable_timeout_is_refused() {
+        // Too short and no human can answer, so every held request is a denial;
+        // too long and the held connection is the bigger problem.
+        let short = err("[approval]\ntimeout='1s'\n\
+             [[approval.require]]\nhost='api.stripe.com'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(short.contains("timeout"), "{short}");
+        let long = err("[approval]\ntimeout='2h'\n\
+             [[approval.require]]\nhost='api.stripe.com'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(long.contains("timeout"), "{long}");
+    }
+
+    #[test]
+    fn an_approval_host_must_be_a_bare_hostname() {
+        let bad = err("[approval]\n\
+             [[approval.require]]\nhost='https://api.stripe.com/v1'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(bad.contains("bare hostname"), "{bad}");
     }
 
     #[test]

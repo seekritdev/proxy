@@ -66,6 +66,7 @@ async fn proxy_for(upstream: SocketAddr, redaction: &str) -> String {
         sessions: Arc::new(SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let addr = spawn(router(state)).await;
     format!("http://{addr}")

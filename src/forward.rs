@@ -45,6 +45,7 @@ use tracing::{debug, info, warn};
 use seekrit_core::policy::Decision;
 
 use crate::activity::{ActivityLog, Cell};
+use crate::approval::{describe_refusal, ApprovalStore, Outcome};
 use crate::config::{Config, UnmatchedPolicy};
 use crate::policy::{now_secs, Gate, PolicyStore};
 use crate::proxy::describe_operation;
@@ -83,6 +84,10 @@ pub struct ForwardState {
     /// [`Self::client`]'s DNS resolver, which is what pins a hostname's approved
     /// addresses to the ones actually dialled.
     pub egress: Arc<crate::egress::Egress>,
+    /// Operations that stop for a human, when `[approval]` is configured. Shared
+    /// with the reverse plane: an operator answers about an operation, not about
+    /// whichever listener happened to carry it.
+    pub approvals: Option<Arc<ApprovalStore>>,
 }
 
 impl ForwardState {
@@ -676,6 +681,50 @@ async fn inject_and_forward(
     // reasoning applies even more strongly here.
     if state.config.propagate_trace_upstream {
         seekrit_telemetry::inject_context(&seekrit_telemetry::current_context(), &mut fwd);
+    }
+
+    // The last moment before anything leaves this process — see the reverse
+    // plane's copy of this block for why it sits after substitution.
+    if let Some(approvals) = state.approvals.as_ref() {
+        let path = path_and_query.split('?').next().unwrap_or("/");
+        match approvals
+            .gate(audit_host, method.as_str(), path, &injected)
+            .await
+        {
+            Outcome::NotRequired => {}
+            Outcome::Approved { waited, standing } => {
+                info!(
+                    target: "seekrit_audit",
+                    %method,
+                    upstream = %audit_host,
+                    path = %path,
+                    waited_ms = waited.as_millis() as u64,
+                    standing,
+                    "an operator approved a held request",
+                );
+            }
+            refused => {
+                let operation = approvals.describe(audit_host, method.as_str(), path);
+                let message = describe_refusal(&refused, &operation);
+                warn!(reason = "approval_refused", "denied: {message}");
+                span.record(seekrit_telemetry::attr::DENY_REASON, "approval_refused");
+                state
+                    .metrics
+                    .record_request(PLANE_FORWARD, "approval_refused");
+                if let Some(log) = state.activity.as_ref() {
+                    log.record(
+                        Cell {
+                            host: audit_host.to_string(),
+                            method: method.as_str().to_string(),
+                            decision: "approval_refused",
+                            rule_index: None,
+                        },
+                        &[],
+                    );
+                }
+                return text(StatusCode::FORBIDDEN, &message);
+            }
+        }
     }
 
     let started = std::time::Instant::now();

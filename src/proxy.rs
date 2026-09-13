@@ -32,6 +32,7 @@ use arc_swap::ArcSwap;
 use seekrit_core::policy::{Decision, Rule};
 
 use crate::activity::{ActivityLog, Cell};
+use crate::approval::{describe_refusal, ApprovalStore, Outcome};
 use crate::config::Config;
 use crate::policy::{now_secs, Gate, PolicyStore};
 use crate::ratchet::{RatchetStore, DEFAULT_SESSION};
@@ -63,6 +64,10 @@ pub struct AppState {
     /// Aggregate decision counts awaiting their next flush, when `[activity]` is
     /// configured. Shared with the forward plane: one ledger per proxy.
     pub activity: Option<Arc<ActivityLog>>,
+    /// Operations that stop for a human, when `[approval]` is configured. Shared
+    /// with the forward plane so a standing `always` means the same thing on
+    /// both — an operator answered once about an operation, not about a listener.
+    pub approvals: Option<Arc<ApprovalStore>>,
 }
 
 /// Build the proxy router: a single fallback that handles every method/path.
@@ -125,6 +130,9 @@ enum Reject {
     /// variant from `Operation` on purpose: policy still permits it, so a refusal
     /// that read like a policy denial would send someone to edit the wrong file.
     Ratchet(String),
+    /// A human declined it, or nobody answered in time. Also distinct from
+    /// `Operation`: the rules permit this request, a person did not.
+    Approval(String),
 }
 
 impl From<SubError> for Reject {
@@ -147,6 +155,7 @@ impl Reject {
             Reject::Operation(_) => "denied",
             Reject::NoPolicy(_) => "no_policy",
             Reject::Ratchet(_) => "ratchet",
+            Reject::Approval(_) => "approval_refused",
         }
     }
 
@@ -161,6 +170,7 @@ impl Reject {
             Reject::Operation(d) => Some(d.reason()),
             Reject::NoPolicy(_) => Some("policy_unavailable"),
             Reject::Ratchet(_) => Some("ratchet_withdrawn"),
+            Reject::Approval(_) => Some("approval_refused"),
             _ => None,
         }
     }
@@ -210,6 +220,10 @@ impl IntoResponse for Reject {
             }
             Reject::Ratchet(m) => {
                 warn!(reason = "ratchet", "denied: withdrawn earlier in this run");
+                (StatusCode::FORBIDDEN, m)
+            }
+            Reject::Approval(m) => {
+                warn!(reason = "approval", "denied: not approved");
                 (StatusCode::FORBIDDEN, m)
             }
         };
@@ -493,6 +507,40 @@ async fn forward(state: AppState, req: Request, span: &tracing::Span) -> Result<
     // third-party APIs that gain nothing from our trace ids.
     if state.config.propagate_trace_upstream {
         seekrit_telemetry::inject_context(&seekrit_telemetry::current_context(), &mut fwd);
+    }
+
+    // The last moment before anything leaves this process. Placed here rather
+    // than beside the policy check so the prompt can name the credential about to
+    // travel; a refusal drops the substituted bytes with the request.
+    if let Some(approvals) = state.approvals.as_ref() {
+        match approvals
+            .gate(&route.host, method.as_str(), rest, &injected)
+            .await
+        {
+            Outcome::NotRequired => {}
+            Outcome::Approved { waited, standing } => {
+                info!(
+                    target: "seekrit_audit",
+                    %method,
+                    upstream = %route.host,
+                    path = %rest,
+                    waited_ms = waited.as_millis() as u64,
+                    standing,
+                    "an operator approved a held request",
+                );
+            }
+            refused => {
+                note(
+                    &state,
+                    &route.host,
+                    method.as_str(),
+                    "approval_refused",
+                    rule_index,
+                );
+                let operation = approvals.describe(&route.host, method.as_str(), rest);
+                return Err(Reject::Approval(describe_refusal(&refused, &operation)));
+            }
+        }
     }
 
     let started = std::time::Instant::now();

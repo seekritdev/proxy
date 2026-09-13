@@ -175,6 +175,12 @@ pub struct ControlState {
     pub tickets: Arc<TicketStore>,
     /// The shared secret an orchestrator must present.
     pub token: Arc<String>,
+    /// Held requests waiting on a human, when `[approval]` is configured.
+    ///
+    /// It shares this listener because it needs exactly the same properties and
+    /// has exactly the same threat model: loopback-bound, token-authenticated,
+    /// and unreachable by the agent whose request is being decided.
+    pub approvals: Option<Arc<crate::approval::ApprovalStore>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -199,17 +205,29 @@ pub struct MintResponse {
     pub header: &'static str,
 }
 
-/// The control router: mint and revoke, nothing else. Deliberately tiny — this
-/// listener exists to hand out tickets, not to expose the proxy's innards.
+/// The control router: mint and revoke tickets, and decide held requests.
+/// Deliberately tiny — this listener exists to answer an orchestrator, not to
+/// expose the proxy's innards.
 pub fn control_router(state: ControlState) -> Router {
     Router::new()
         .route("/session", axum::routing::post(mint))
         .route("/session/revoke", axum::routing::post(revoke))
+        .route(
+            "/approvals",
+            axum::routing::get(crate::approval::list_pending),
+        )
+        .route(
+            "/approvals/{id}",
+            axum::routing::post(crate::approval::decide_pending),
+        )
         .route("/health", axum::routing::get(health))
         .with_state(state)
 }
 
-fn authenticate(state: &ControlState, headers: &HeaderMap) -> Result<(), (StatusCode, String)> {
+pub(crate) fn authenticate(
+    state: &ControlState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, String)> {
     let presented = headers
         .get(CONTROL_TOKEN_HEADER)
         .and_then(|v| v.to_str().ok())

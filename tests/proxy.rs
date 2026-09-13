@@ -108,6 +108,7 @@ async fn harness() -> (String, Hits) {
         sessions: Arc::new(SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn(router(state)).await;
     (format!("http://{proxy}"), hits)
@@ -231,6 +232,7 @@ async fn harness_with(
         sessions: Arc::new(SessionResolver::new(tickets, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn(router(state)).await;
     (format!("http://{proxy}"), upstream, hits)
@@ -535,6 +537,7 @@ async fn the_ticket_header_never_reaches_the_upstream() {
         sessions: Arc::new(SessionResolver::new(Some(tickets), None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn(router(state)).await;
 
@@ -599,6 +602,7 @@ async fn the_ratchet_withdraws_a_host_after_a_protected_request() {
         sessions: Arc::new(SessionResolver::new(None, None)),
         ratchet: Some(ratchet.clone()),
         activity: None,
+        approvals: None,
     };
     let proxy = spawn(router(state)).await;
     let base = format!("http://{proxy}");
@@ -743,6 +747,7 @@ async fn a_dispatched_task_narrows_the_run_and_is_introspected_once() {
         sessions: Arc::new(SessionResolver::new(None, Some(tasks))),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn(router(state)).await;
     let base = format!("http://{proxy}");

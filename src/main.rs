@@ -18,6 +18,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use seekrit_cache::{Cache, CacheKey, Lookup};
 use seekrit_proxy::activity::ActivityLog;
+use seekrit_proxy::approval::ApprovalStore;
 use seekrit_proxy::ca::Ca;
 use seekrit_proxy::config::{CacheConfig, Config};
 use seekrit_proxy::egress::Egress;
@@ -238,6 +239,35 @@ async fn serve() -> i32 {
         );
     }
 
+    // Operations that stop for a human. Built before the listeners because the
+    // control listener needs it and because it can refuse to start.
+    let approvals = match config.approval.clone() {
+        Some(approval) => {
+            // A proxy that can hold a request but cannot ask anyone is a denial
+            // generator with extra latency: every matching request would wait out
+            // its timeout with nobody able to answer. Refuse now, where it will be
+            // read, rather than at the first `POST /v1/charges`.
+            let interactive = std::io::IsTerminal::is_terminal(&std::io::stdin());
+            if config.control.is_none() && !interactive {
+                error!(
+                    "[approval] is configured but this proxy has no way to ask: stdin is not a \
+                     terminal and there is no [control] listener. Add a [control] block (and set \
+                     {CONTROL_TOKEN_ENV}) so decisions can arrive over it, or run the proxy \
+                     attached to a terminal"
+                );
+                return 2;
+            }
+            info!(
+                rules = approval.require.len(),
+                timeout = %seekrit_cache::humanize(approval.timeout),
+                interactive,
+                "holding declared operations for an operator's approval; no answer is a refusal"
+            );
+            Some(Arc::new(ApprovalStore::new(approval)))
+        }
+        None => None,
+    };
+
     // Say what response redaction will and will not cover, once, at startup.
     //
     // The second half matters more than the first: a value below `min_length` is
@@ -389,10 +419,11 @@ async fn serve() -> i32 {
                     return 1;
                 }
             };
-            info!(listen = %control.listen, "control listener ready (POST /session to mint a ticket)");
+            info!(listen = %control.listen, "control listener ready (POST /session to mint a ticket; GET /approvals to see what is held)");
             let state = ControlState {
                 tickets: tickets.clone(),
                 token: Arc::new(control_token),
+                approvals: approvals.clone(),
             };
             let sd = shutdown(rx.clone());
             tokio::spawn(async move {
@@ -460,6 +491,18 @@ async fn serve() -> i32 {
 
     let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // The terminal prompt, when there is a terminal to prompt on. The control
+    // listener works either way; this is what makes the control usable on a
+    // laptop without a second window.
+    if let Some(store) = approvals.clone() {
+        if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+            tasks.push(tokio::spawn(seekrit_proxy::approval::prompt_loop(
+                store,
+                rx.clone(),
+            )));
+        }
+    }
+
     if let (Some(log), Some(cfg)) = (activity.clone(), config.activity.as_ref()) {
         // Reported under the default identity: a proxy fronting several agents
         // does not yet split its ledger per identity (see the guide's caveat).
@@ -502,6 +545,7 @@ async fn serve() -> i32 {
             sessions: sessions.clone(),
             ratchet: ratchet.clone(),
             activity: activity.clone(),
+            approvals: approvals.clone(),
         };
         let sd = shutdown(rx.clone());
         tasks.push(tokio::spawn(async move {
@@ -554,6 +598,7 @@ async fn serve() -> i32 {
             sessions: sessions.clone(),
             ratchet: ratchet.clone(),
             activity: activity.clone(),
+            approvals: approvals.clone(),
         };
         let sd = shutdown(rx.clone());
         tasks.push(tokio::spawn(async move {

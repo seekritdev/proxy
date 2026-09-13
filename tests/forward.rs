@@ -201,6 +201,7 @@ async fn http_forward_substitutes_matched_host() {
         sessions: std::sync::Arc::new(seekrit_proxy::tasks::SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn_forward(state).await;
 
@@ -259,6 +260,7 @@ async fn http_forward_denies_unmatched_host() {
         sessions: std::sync::Arc::new(seekrit_proxy::tasks::SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn_forward(state).await;
 
@@ -301,6 +303,7 @@ async fn https_mitm_substitutes_and_forwards() {
         sessions: std::sync::Arc::new(seekrit_proxy::tasks::SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn_forward(state).await;
 
@@ -360,6 +363,7 @@ async fn http_forward_enforces_operation_constraints_on_a_ruled_host() {
         sessions: std::sync::Arc::new(seekrit_proxy::tasks::SessionResolver::new(None, None)),
         ratchet: None,
         activity: None,
+        approvals: None,
     };
     let proxy = spawn_forward(state).await;
 

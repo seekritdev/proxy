@@ -53,7 +53,11 @@ tokio = { version = "1", features = [
   "net",
   "signal",
   "io-util",
+  # The approval prompt reads stdin (src/approval.rs). Only reached when stdin
+  # is a terminal; in a container the control listener is the whole interface.
+  "io-std",
   "sync",
+  "time",
 ] }
 axum = "0.8"
 reqwest = { version = "0.12", default-features = false, features = [
