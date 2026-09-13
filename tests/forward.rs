@@ -6,6 +6,11 @@
 //!      trust the proxy's CA, sends `Authorization: Bearer {{seekrit:…}}` to a
 //!      real TLS upstream; the proxy terminates TLS, substitutes, and forwards
 //!      to the upstream over its own TLS. The upstream sees the real secret.
+//!
+//! The mock upstream echoes the credential straight back, which is the exact
+//! behaviour `redact.rs` exists for — so what the upstream *received* is asserted
+//! through a side channel ([`Hits::received`]) rather than by reading it out of
+//! the response, and the response is asserted to be scrubbed.
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -29,17 +34,36 @@ use seekrit_proxy::secrets::SecretStore;
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+/// The mock upstream's view of what actually arrived: a request count, plus the
+/// last `authorization` header and body it saw.
+///
+/// The side channel matters — the proxy now scrubs injected credentials out of
+/// responses, so a test cannot prove substitution happened by reading the echo
+/// back through the proxy. It has to ask the upstream.
 #[derive(Clone, Default)]
-struct Hits(Arc<AtomicUsize>);
+struct Hits {
+    count: Arc<AtomicUsize>,
+    received: Arc<std::sync::Mutex<Option<(String, String)>>>,
+}
+
 impl Hits {
     fn get(&self) -> usize {
-        self.0.load(SeqCst)
+        self.count.load(SeqCst)
+    }
+
+    /// The (authorization, body) the upstream last saw.
+    fn received(&self) -> (String, String) {
+        self.received
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the upstream was reached")
     }
 }
 
 /// Echo the request's `authorization` header and body back as JSON.
 async fn echo(req: Request<Incoming>, hits: Hits) -> Result<Response<Full<Bytes>>, Infallible> {
-    hits.0.fetch_add(1, SeqCst);
+    hits.count.fetch_add(1, SeqCst);
     let auth = req
         .headers()
         .get("authorization")
@@ -51,11 +75,9 @@ async fn echo(req: Request<Incoming>, hits: Hits) -> Result<Response<Full<Bytes>
         .await
         .map(|c| c.to_bytes())
         .unwrap_or_default();
-    let out = format!(
-        "{{\"authorization\":\"{}\",\"body\":\"{}\"}}",
-        auth,
-        String::from_utf8_lossy(&body)
-    );
+    let body = String::from_utf8_lossy(&body).to_string();
+    *hits.received.lock().unwrap() = Some((auth.clone(), body.clone()));
+    let out = format!("{{\"authorization\":\"{auth}\",\"body\":\"{body}\"}}");
     Ok(Response::new(Full::new(Bytes::from(out))))
 }
 
@@ -190,10 +212,19 @@ async fn http_forward_substitutes_matched_host() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let json: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(json["authorization"], "Bearer s3cr3t-value");
-    assert_eq!(json["body"], "b=s3cr3t-value");
+    // What the upstream saw: the real, decrypted value in both places.
+    assert_eq!(
+        hits.received(),
+        ("Bearer s3cr3t-value".into(), "b=s3cr3t-value".into())
+    );
     assert_eq!(hits.get(), 1);
+    // What came back to the agent: the upstream's echo, scrubbed.
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains("s3cr3t-value"),
+        "echo reached the agent: {text}"
+    );
+    assert!(text.contains("[redacted by seekrit]"), "{text}");
 }
 
 #[tokio::test]
@@ -274,11 +305,16 @@ async fn https_mitm_substitutes_and_forwards() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
-    let json: serde_json::Value = resp.json().await.unwrap();
     // The upstream, behind real TLS, saw the decrypted secret — proving the
     // proxy terminated, substituted, and re-originated TLS end to end.
-    assert_eq!(json["authorization"], "Bearer s3cr3t-value");
+    assert_eq!(hits.received().0, "Bearer s3cr3t-value");
     assert_eq!(hits.get(), 1);
+    // And the echo does not survive the trip back through the MITM.
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains("s3cr3t-value"),
+        "echo reached the agent: {text}"
+    );
 }
 
 #[tokio::test]

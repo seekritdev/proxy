@@ -160,6 +160,9 @@ pub mod attr {
     /// protected event narrows the run). A state *name* from the operator's own
     /// config — it says how much capability is left, never what was read.
     pub const RATCHET_STATE: &str = "seekrit.ratchet.state";
+    /// How many injected credential echoes were scrubbed from one upstream
+    /// response (proxy). A count of replacements, never the bytes replaced.
+    pub const REDACTION_COUNT: &str = "seekrit.redaction.count";
     /// AWS KMS operation name, e.g. `Encrypt`, `GenerateDataKey`.
     pub const KMS_OPERATION: &str = "seekrit.kms.operation";
     /// Managed key id an operation ran against.

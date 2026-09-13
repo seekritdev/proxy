@@ -19,15 +19,44 @@ use seekrit_proxy::secrets::SecretStore;
 use tokio::net::TcpListener;
 
 /// A mock upstream that echoes back what it received: the `authorization`
-/// header and the request body, as JSON. Also flips a flag if it is ever hit.
+/// header and the request body, as JSON. Also counts hits and records what
+/// actually arrived.
+///
+/// The echo is deliberate — it is the behaviour `redact.rs` exists for — so a
+/// test proves substitution through [`Hits::received`] (what the upstream saw)
+/// rather than by reading the value back out of a response the proxy has since
+/// scrubbed.
 #[derive(Clone, Default)]
-struct Hits(Arc<std::sync::atomic::AtomicUsize>);
+struct Hits {
+    count: Arc<std::sync::atomic::AtomicUsize>,
+    received: Arc<std::sync::Mutex<Option<(String, String)>>>,
+}
+
+impl Hits {
+    fn count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The (authorization, body) the upstream last saw.
+    fn received(&self) -> (String, String) {
+        self.received
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the upstream was reached")
+    }
+
+    /// The `authorization` header the upstream last saw.
+    fn authorization(&self) -> String {
+        self.received().0
+    }
+}
 
 async fn echo(
     State(hits): State<Hits>,
     req: axum::extract::Request,
 ) -> axum::Json<serde_json::Value> {
-    hits.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    hits.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let auth = req
         .headers()
         .get("authorization")
@@ -37,9 +66,11 @@ async fn echo(
     let body = axum::body::to_bytes(req.into_body(), 1 << 20)
         .await
         .unwrap_or_default();
+    let body = String::from_utf8_lossy(&body).to_string();
+    *hits.received.lock().unwrap() = Some((auth.clone(), body.clone()));
     axum::Json(serde_json::json!({
         "authorization": auth,
-        "body": String::from_utf8_lossy(&body),
+        "body": body,
     }))
 }
 
@@ -66,7 +97,7 @@ async fn harness() -> (String, Hits) {
     let state = AppState {
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store)),
-        client: reqwest::Client::new(),
+        client: seekrit_proxy::upstream_client().unwrap(),
         // No exporter configured in tests, so these instruments are no-ops.
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         // These harnesses exercise file policy: no server bundles, no tickets.
@@ -93,10 +124,21 @@ async fn substitutes_header_and_body_then_forwards() {
         .unwrap();
 
     assert_eq!(resp.status(), 200);
-    let json: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(json["authorization"], "Bearer s3cr3t-value");
-    assert_eq!(json["body"], "prefix s3cr3t-value suffix");
-    assert_eq!(hits.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // What the upstream received.
+    assert_eq!(
+        hits.received(),
+        (
+            "Bearer s3cr3t-value".into(),
+            "prefix s3cr3t-value suffix".into()
+        )
+    );
+    assert_eq!(hits.count(), 1);
+    // What the caller got back: the upstream's echo, with the value scrubbed.
+    let text = resp.text().await.unwrap();
+    assert!(
+        !text.contains("s3cr3t-value"),
+        "the echo reached the caller: {text}"
+    );
 }
 
 #[tokio::test]
@@ -132,7 +174,7 @@ async fn denies_secret_not_on_allowlist_and_never_forwards() {
 
     assert_eq!(resp.status(), 403);
     // Crucially, the upstream must NOT have been contacted.
-    assert_eq!(hits.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(hits.count(), 0);
 }
 
 #[tokio::test]
@@ -177,7 +219,7 @@ async fn harness_with(
     let state = AppState {
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store)),
-        client: reqwest::Client::new(),
+        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: policy_for(&upstream),
         sessions: Arc::new(SessionResolver::new(tickets, None)),
@@ -263,7 +305,7 @@ async fn a_method_the_route_does_not_permit_is_refused_before_the_upstream() {
         .contains("path is not permitted"));
 
     assert_eq!(
-        hits.0.load(std::sync::atomic::Ordering::SeqCst),
+        hits.count(),
         1,
         "only the permitted request should have reached the upstream"
     );
@@ -304,10 +346,7 @@ async fn server_policy_authorizes_the_reverse_plane() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
-    assert_eq!(
-        ok.json::<serde_json::Value>().await.unwrap()["authorization"],
-        "Bearer s3cr3t-value"
-    );
+    assert_eq!(hits.authorization(), "Bearer s3cr3t-value");
 
     // A secret the published policy does not allow toward this host.
     let denied = client
@@ -317,7 +356,7 @@ async fn server_policy_authorizes_the_reverse_plane() {
         .await
         .unwrap();
     assert_eq!(denied.status(), 403);
-    assert_eq!(hits.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(hits.count(), 1);
 }
 
 #[tokio::test]
@@ -353,7 +392,7 @@ async fn an_expired_policy_fails_closed() {
         .unwrap();
     assert_eq!(resp.status(), 403);
     assert!(resp.text().await.unwrap().contains("expired"));
-    assert_eq!(hits.0.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(hits.count(), 0);
 }
 
 #[tokio::test]
@@ -408,8 +447,7 @@ async fn a_session_ticket_narrows_but_never_widens() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
-    let body: serde_json::Value = ok.json().await.unwrap();
-    assert_eq!(body["authorization"], "Bearer s3cr3t-value");
+    assert_eq!(hits.authorization(), "Bearer s3cr3t-value");
 
     // Allowed by policy, left out of the ticket: refused.
     let out_of_scope = client
@@ -440,7 +478,7 @@ async fn a_session_ticket_narrows_but_never_widens() {
         .unwrap();
     assert_eq!(bogus.status(), 403);
 
-    assert_eq!(hits.0.load(std::sync::atomic::Ordering::SeqCst), 2);
+    assert_eq!(hits.count(), 2);
 }
 
 #[tokio::test]
@@ -458,7 +496,7 @@ async fn the_ticket_header_never_reaches_the_upstream() {
         Router::new()
             .fallback(any(
                 |State(hits): State<Hits>, req: axum::extract::Request| async move {
-                    hits.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    hits.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let names: Vec<String> = req
                         .headers()
                         .keys()
@@ -482,7 +520,7 @@ async fn the_ticket_header_never_reaches_the_upstream() {
             "TEST_KEY".to_string(),
             "s3cr3t-value".to_string(),
         )]))),
-        client: reqwest::Client::new(),
+        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: None,
         sessions: Arc::new(SessionResolver::new(Some(tickets), None)),
@@ -543,7 +581,7 @@ async fn the_ratchet_withdraws_a_host_after_a_protected_request() {
             "TEST_KEY".to_string(),
             "s3cr3t-value".to_string(),
         )]))),
-        client: reqwest::Client::new(),
+        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: None,
         sessions: Arc::new(SessionResolver::new(None, None)),
@@ -590,7 +628,7 @@ async fn the_ratchet_withdraws_a_host_after_a_protected_request() {
     // The upstream saw exactly the two permitted requests; the refusal never left
     // the proxy.
     assert_eq!(
-        hits.0.load(std::sync::atomic::Ordering::SeqCst),
+        hits.count(),
         2,
         "a withdrawn request must not reach upstream"
     );
@@ -684,7 +722,7 @@ async fn a_dispatched_task_narrows_the_run_and_is_introspected_once() {
             ("TEST_KEY".to_string(), "s3cr3t-value".to_string()),
             ("OTHER_KEY".to_string(), "other-value".to_string()),
         ]))),
-        client: reqwest::Client::new(),
+        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: None,
         sessions: Arc::new(SessionResolver::new(None, Some(tasks))),
@@ -704,8 +742,7 @@ async fn a_dispatched_task_narrows_the_run_and_is_introspected_once() {
         .await
         .unwrap();
     assert_eq!(ok.status(), 200);
-    let body: serde_json::Value = ok.json().await.unwrap();
-    assert_eq!(body["authorization"], "Bearer other-value");
+    assert_eq!(hits.authorization(), "Bearer other-value");
 
     // …and TEST_KEY does not, even though the route's own allowlist names it.
     // The task's scopes intersect with policy; they never add to it.

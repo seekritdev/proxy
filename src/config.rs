@@ -65,6 +65,7 @@ struct RawConfig {
     tasks: Option<RawTasks>,
     ratchet: Option<RawRatchet>,
     activity: Option<RawActivity>,
+    redaction: Option<RawRedaction>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -168,6 +169,17 @@ struct RawActivity {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawRedaction {
+    enabled: Option<bool>,
+    scan: Option<String>,
+    placeholder: Option<String>,
+    min_length: Option<usize>,
+    /// Which encoded forms of a value to also match. Absent = all of them.
+    #[serde(default)]
+    encodings: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawRatchet {
     #[serde(default)]
     state: Vec<RawRatchetState>,
@@ -240,6 +252,17 @@ pub struct Config {
     /// it carries (hosts, methods, secret names, counts, and never a path) is the
     /// same vocabulary their own telemetry already exports.
     pub activity: Option<ActivityConfig>,
+    /// Scrub injected credentials back out of upstream *responses*.
+    ///
+    /// `Some` by default — unlike every other block here, because an upstream
+    /// echoing a key back into an agent's context is the failure this proxy
+    /// exists to prevent, and a control that only protects the deployments that
+    /// went looking for it protects nobody. `enabled = false` turns it off.
+    ///
+    /// Costs nothing on a request that injected nothing: with no needles there
+    /// is no scanner, and the response streams through on the same path it took
+    /// before this existed.
+    pub redaction: Option<crate::redact::RedactionConfig>,
 }
 
 /// The validated `[activity]` block.
@@ -415,6 +438,7 @@ pub enum ConfigError {
     Tasks(String),
     Ratchet(String),
     Activity(String),
+    Redaction(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -432,6 +456,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Tasks(m) => write!(f, "invalid [tasks] config: {m}"),
             ConfigError::Ratchet(m) => write!(f, "invalid [ratchet] config: {m}"),
             ConfigError::Activity(m) => write!(f, "invalid [activity] config: {m}"),
+            ConfigError::Redaction(m) => write!(f, "invalid [redaction] config: {m}"),
         }
     }
 }
@@ -523,6 +548,7 @@ impl Config {
         let tasks = raw.tasks.map(TasksConfig::validate).transpose()?;
         let activity = raw.activity.map(ActivityConfig::validate).transpose()?;
         let ratchet = raw.ratchet.map(validate_ratchet).transpose()?;
+        let redaction = validate_redaction(raw.redaction)?;
 
         Ok(Config {
             listen,
@@ -539,6 +565,7 @@ impl Config {
             tasks,
             ratchet,
             activity,
+            redaction,
         })
     }
 
@@ -779,6 +806,93 @@ impl TasksConfig {
         Ok(TasksConfig { cache_ttl })
     }
 }
+
+/// Validate `[redaction]` — or synthesise the default when the block is absent.
+///
+/// This is the one block whose *absence* means on. Response redaction closes the
+/// half of the credential boundary substitution cannot reach, and a security
+/// control that only reaches deployments which went looking for it in the docs
+/// reaches almost none. Opting out is explicit and one line.
+///
+/// Two values are refused rather than clamped, because each would quietly turn
+/// the control into something other than what it says on the tin:
+///
+/// - a `min_length` below [`MIN_REDACTION_LENGTH`], which is how you end up
+///   scanning responses for `true` and shredding unrelated payloads;
+/// - an empty `placeholder`, which deletes the matched bytes and leaves a reader
+///   unable to tell a redaction from a field the upstream never sent.
+fn validate_redaction(
+    raw: Option<RawRedaction>,
+) -> Result<Option<crate::redact::RedactionConfig>, ConfigError> {
+    use crate::redact::{RedactionConfig, Scan};
+
+    let Some(raw) = raw else {
+        return Ok(Some(RedactionConfig::default()));
+    };
+    if !raw.enabled.unwrap_or(true) {
+        return Ok(None);
+    }
+
+    let scan = match raw.scan.as_deref() {
+        None | Some("injected") => Scan::Injected,
+        Some("all") => Scan::All,
+        Some(other) => {
+            return Err(ConfigError::Redaction(format!(
+                "unknown scan {other:?} — use \"injected\" (this request's own substitutions) or \"all\" (every resolved secret)"
+            )))
+        }
+    };
+
+    let mut config = RedactionConfig {
+        scan,
+        ..RedactionConfig::default()
+    };
+
+    if let Some(placeholder) = raw.placeholder {
+        if placeholder.is_empty() {
+            return Err(ConfigError::Redaction(
+                "placeholder must not be empty — an empty one deletes the matched bytes, so a \
+                 reader cannot tell a redaction from a field the upstream never sent"
+                    .into(),
+            ));
+        }
+        config.placeholder = placeholder;
+    }
+
+    if let Some(min_length) = raw.min_length {
+        if min_length < MIN_REDACTION_LENGTH {
+            return Err(ConfigError::Redaction(format!(
+                "min_length {min_length} is below the {MIN_REDACTION_LENGTH}-byte floor — matching \
+                 values that short rewrites unrelated response bytes far more often than it \
+                 catches a credential"
+            )));
+        }
+        config.min_length = min_length;
+    }
+
+    if let Some(encodings) = raw.encodings {
+        config.percent = false;
+        config.json = false;
+        for e in &encodings {
+            match e.as_str() {
+                "percent" => config.percent = true,
+                "json" => config.json = true,
+                other => {
+                    return Err(ConfigError::Redaction(format!(
+                        "unknown encoding {other:?} — known encodings are \"percent\" and \"json\" \
+                         (the exact value is always matched)"
+                    )))
+                }
+            }
+        }
+    }
+
+    Ok(Some(config))
+}
+
+/// Floor on `[redaction] min_length`. Below this the matcher does more damage to
+/// ordinary responses than it prevents.
+const MIN_REDACTION_LENGTH: usize = 6;
 
 /// Validate `[ratchet]` into the ordered state machine `crate::ratchet` runs.
 ///
@@ -1095,6 +1209,13 @@ mod tests {
         Config::from_toml(t).expect("valid config")
     }
 
+    /// The rendered error from a config that must not load.
+    fn err(t: &str) -> String {
+        Config::from_toml(t)
+            .expect_err("config should be refused")
+            .to_string()
+    }
+
     /// The one-rule set a file-mode route carries.
     fn route_rules<'a>(c: &'a Config, path: &str) -> &'a RuleSet {
         c.match_route(path)
@@ -1117,6 +1238,71 @@ mod tests {
         assert!(c.policy.signers.is_empty());
         assert!(c.secrets.refresh_interval.is_none());
         assert!(c.control.is_none());
+    }
+
+    #[test]
+    fn redaction_is_on_without_being_asked_for() {
+        // The one block whose absence means on: an upstream echoing a credential
+        // back into an agent's context is the failure this proxy exists to
+        // prevent, and a control nobody finds in the docs protects nobody.
+        let c = cfg("[[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        let r = c.redaction.expect("redaction on by default");
+        assert_eq!(r.scan, crate::redact::Scan::Injected);
+        assert_eq!(r.min_length, crate::redact::DEFAULT_MIN_LENGTH);
+        assert!(r.percent && r.json);
+    }
+
+    #[test]
+    fn redaction_can_be_turned_off() {
+        let c = cfg("[redaction]\nenabled=false\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(c.redaction.is_none());
+    }
+
+    #[test]
+    fn redaction_scan_all_is_opt_in() {
+        let c = cfg("[redaction]\nscan='all'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert_eq!(c.redaction.unwrap().scan, crate::redact::Scan::All);
+    }
+
+    #[test]
+    fn redaction_encodings_narrow_rather_than_extend() {
+        let c = cfg("[redaction]\nencodings=['percent']\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        let r = c.redaction.unwrap();
+        assert!(r.percent);
+        assert!(!r.json, "naming one encoding opts out of the others");
+    }
+
+    #[test]
+    fn a_too_short_min_length_is_refused_rather_than_clamped() {
+        // Silently raising it would leave an operator believing short values are
+        // covered; matching them would shred unrelated responses.
+        let err = err("[redaction]\nmin_length=2\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(err.contains("min_length"), "{err}");
+        assert!(err.contains("floor"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_placeholder_is_refused() {
+        let err = err("[redaction]\nplaceholder=''\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(err.contains("placeholder"), "{err}");
+    }
+
+    #[test]
+    fn unknown_redaction_settings_name_what_is_valid() {
+        let scan = err("[redaction]\nscan='everything'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(scan.contains("injected") && scan.contains("all"), "{scan}");
+        let encoding = err("[redaction]\nencodings=['base64']\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(
+            encoding.contains("percent") && encoding.contains("json"),
+            "{encoding}"
+        );
     }
 
     #[test]

@@ -25,11 +25,28 @@ const SECRET_NAME: &str = "EXAMPLE_API_KEY";
 
 /// A mock upstream that accepts anything, so the proxy completes the full
 /// substitute-and-forward path (the span is only finished at the end of it).
+///
+/// `/echo` quotes the `authorization` header straight back, which is the
+/// behaviour `redact.rs` handles — and the path along which a careless
+/// implementation would put the plaintext into a span while reporting it.
 async fn spawn_upstream() -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let app = axum::Router::new().fallback(|| async { "ok" });
+        let app = axum::Router::new()
+            .route(
+                "/echo",
+                axum::routing::any(|req: axum::extract::Request| async move {
+                    let auth = req
+                        .headers()
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("")
+                        .to_string();
+                    format!("upstream error: bad key {auth}")
+                }),
+            )
+            .fallback(|| async { "ok" });
         axum::serve(listener, app).await.unwrap();
     });
     format!("http://{addr}")
@@ -53,7 +70,7 @@ allow = ["{SECRET_NAME}"]
             SECRET_NAME.to_string(),
             SECRET_VALUE.to_string(),
         )]))),
-        client: reqwest::Client::new(),
+        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         // File policy, no tickets: this harness is about what reaches a span.
         policy: None,
@@ -156,4 +173,43 @@ async fn passthrough_request_records_no_secret_material() {
     assert!(resp.status().is_success());
 
     capture.assert_absent(&[SECRET_VALUE, "CANARY", "9f3a2b8c"]);
+}
+
+/// Redaction is a *reporting* path that runs with the plaintext in hand: it
+/// knows the value, searches for it, and then says so. The obvious mistake — a
+/// span field naming what was scrubbed — would disclose exactly the credential
+/// the scrub exists to contain, so the same rule is enforced here.
+#[tokio::test]
+async fn reporting_an_echoed_credential_records_the_name_not_the_value() {
+    let capture = Capture::install();
+
+    let upstream = spawn_upstream().await;
+    let proxy = spawn_proxy(&upstream).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("{proxy}/up/echo"))
+        .header(
+            "authorization",
+            format!("Bearer {{{{seekrit:{SECRET_NAME}}}}}"),
+        )
+        .send()
+        .await
+        .expect("request should reach the upstream");
+    assert!(resp.status().is_success());
+
+    // The response itself is scrubbed — the test would otherwise be asserting
+    // telemetry hygiene for a feature that was not running.
+    let body = resp.text().await.unwrap();
+    assert!(
+        !body.contains(SECRET_VALUE),
+        "the echo reached the caller: {body}"
+    );
+
+    capture.assert_absent(&[SECRET_VALUE, "CANARY", "9f3a2b8c"]);
+
+    let emitted = capture.emitted_strings();
+    assert!(
+        emitted.iter().any(|s| s.contains(SECRET_NAME)),
+        "the echoed secret's NAME should be reported: {emitted:?}"
+    );
 }

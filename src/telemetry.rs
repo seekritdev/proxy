@@ -22,6 +22,7 @@ pub const PLANE_FORWARD: &str = "forward";
 pub struct Metrics {
     requests: Counter<u64>,
     injections: Counter<u64>,
+    redactions: Counter<u64>,
     upstream_duration: Histogram<f64>,
 }
 
@@ -36,6 +37,12 @@ impl Metrics {
             injections: meter
                 .u64_counter("seekrit.proxy.injections")
                 .with_description("Secret substitutions performed, by upstream.")
+                .build(),
+            redactions: meter
+                .u64_counter("seekrit.proxy.redactions")
+                .with_description(
+                    "Injected credential echoes scrubbed from upstream responses, by upstream.",
+                )
                 .build(),
             upstream_duration: meter
                 .f64_histogram("seekrit.proxy.upstream_duration")
@@ -63,6 +70,22 @@ impl Metrics {
             return;
         }
         self.injections.add(
+            count as u64,
+            &[KeyValue::new("upstream", upstream.to_string())],
+        );
+    }
+
+    /// `count` echoed credential values were scrubbed out of a response from
+    /// `upstream`.
+    ///
+    /// A non-zero rate here is worth an alert of its own: it means an upstream is
+    /// handing a credential straight back toward the workload, and the only thing
+    /// standing between that and the agent's context window is this proxy.
+    pub fn record_redactions(&self, upstream: &str, count: usize) {
+        if count == 0 {
+            return;
+        }
+        self.redactions.add(
             count as u64,
             &[KeyValue::new("upstream", upstream.to_string())],
         );

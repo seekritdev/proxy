@@ -1,12 +1,15 @@
 //! The data plane: a reverse proxy that rewrites `{{seekrit:NAME}}`
 //! placeholders in each request (path, headers, body) into decrypted values,
-//! then forwards to the route's upstream and streams the response straight back.
+//! then forwards to the route's upstream and streams the response back.
 //!
-//! Only the **request** is rewritten; the response is streamed untouched, so
-//! SSE / streaming APIs work without buffering. Substitution is gated by the
-//! route's allowlist (default-deny) — the property that stops the proxy being
-//! an exfiltration oracle: a secret can only reach the upstream(s) declared for
-//! it.
+//! On the way back the response passes through [`crate::redact`], which scrubs
+//! out any credential the upstream echoed at us — incrementally, so SSE and
+//! streaming APIs still work without buffering, and skipped entirely on a request
+//! that injected nothing.
+//!
+//! Substitution is gated by the route's allowlist (default-deny) — the property
+//! that stops the proxy being an exfiltration oracle: a secret can only reach the
+//! upstream(s) declared for it.
 //!
 //! The gate is wider than the allowlist now: a rule may also bound the
 //! **methods** and **paths** an agent may reach on that upstream, which turns
@@ -77,6 +80,7 @@ async fn handle(State(state): State<AppState>, req: Request) -> Response {
         { seekrit_telemetry::attr::ROUTE_PREFIX } = tracing::field::Empty,
         { seekrit_telemetry::attr::SECRET_NAMES } = tracing::field::Empty,
         { seekrit_telemetry::attr::DENY_REASON } = tracing::field::Empty,
+        { seekrit_telemetry::attr::REDACTION_COUNT } = tracing::field::Empty,
         "http.response.status_code" = tracing::field::Empty,
     );
     seekrit_telemetry::set_parent_context(&span, seekrit_telemetry::extract_context(req.headers()));
@@ -505,13 +509,14 @@ async fn forward(state: AppState, req: Request, span: &tracing::Span) -> Result<
         .record_upstream_duration(&route.host, started.elapsed().as_secs_f64() * 1000.0);
     state.metrics.record_request(PLANE_REVERSE, "forwarded");
 
-    // Stream the response back untouched (drop hop-by-hop + framing headers so
-    // hyper re-frames it for the downstream connection).
+    // Stream the response back (drop hop-by-hop + framing headers so hyper
+    // re-frames it for the downstream connection), scrubbing out any credential
+    // the upstream echoed on the way.
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let mut out = Response::new(Body::from_stream(resp.bytes_stream()));
-    *out.status_mut() = status;
-    let h = out.headers_mut();
+    let redactor = crate::redact::for_response(state.config.redaction.as_ref(), &injected, store);
+
+    let mut headers = HeaderMap::with_capacity(resp_headers.len());
     for (name, value) in resp_headers.iter() {
         if is_hop_by_hop(name)
             || *name == header::CONTENT_LENGTH
@@ -519,9 +524,70 @@ async fn forward(state: AppState, req: Request, span: &tracing::Span) -> Result<
         {
             continue;
         }
-        h.insert(name.clone(), value.clone());
+        headers.append(name.clone(), value.clone());
     }
+
+    let body = match redactor {
+        None => Body::from_stream(resp.bytes_stream()),
+        Some(redactor) => {
+            // Headers first, and synchronously: unlike the body, this happens
+            // while the request span is still open, so it is the one redaction
+            // that can be recorded as a span field.
+            let header_hits = crate::redact::redact_headers(&redactor, &mut headers);
+            if header_hits > 0 {
+                span.record(seekrit_telemetry::attr::REDACTION_COUNT, header_hits as i64);
+                state.metrics.record_redactions(&route.host, header_hits);
+                report_echo(&route.host, redactor.names());
+            }
+            Body::from_stream(crate::redact::redacting_stream(
+                resp.bytes_stream(),
+                redactor.clone(),
+                echo_reporter(state.metrics.clone(), route.host.clone(), &redactor),
+            ))
+        }
+    };
+
+    let mut out = Response::new(body);
+    *out.status_mut() = status;
+    *out.headers_mut() = headers;
     Ok(out)
+}
+
+/// The audit line for an upstream handing a credential back.
+///
+/// Security-significant in its own right, and separate from the substitution log:
+/// that one says a secret went out, this one says the far end tried to send it
+/// straight back toward the workload. Names only, as everywhere else.
+pub fn report_echo(host: &str, names: &[String]) {
+    warn!(
+        target: "seekrit_audit",
+        upstream = %host,
+        secrets = ?names,
+        "upstream echoed an injected credential; redacted from the response",
+    );
+}
+
+/// The `on_hit` callback for a streaming body.
+///
+/// The request span has closed by the time a body chunk is scanned (axum returns
+/// the response once the headers are ready), so reporting goes to the metric and
+/// the audit log rather than a span field. The audit line is emitted once per
+/// response however many chunks match — a streamed error page can repeat the same
+/// echo many times, and one line per chunk would bury the event it is meant to
+/// surface.
+fn echo_reporter(
+    metrics: Arc<Metrics>,
+    host: String,
+    redactor: &crate::redact::Redactor,
+) -> impl Fn(usize) + Send + 'static {
+    let names = redactor.names().to_vec();
+    let reported = std::sync::atomic::AtomicBool::new(false);
+    move |hits: usize| {
+        metrics.record_redactions(&host, hits);
+        if !reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            report_echo(&host, &names);
+        }
+    }
 }
 
 /// The 403 body for an operation refusal.

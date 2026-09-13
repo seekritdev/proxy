@@ -169,10 +169,9 @@ async fn serve() -> i32 {
         .or_else(|| env_nonempty("SEEKRIT_API_URL"))
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
-    let client = match reqwest::Client::builder()
-        .user_agent(concat!("seekrit-proxy/", env!("CARGO_PKG_VERSION")))
-        .build()
-    {
+    // One place decides how this client is built — see `upstream_client`; the
+    // headline is that an upstream redirect is never followed.
+    let client = match seekrit_proxy::upstream_client() {
         Ok(c) => c,
         Err(e) => {
             error!("could not build HTTP client: {e}");
@@ -207,6 +206,31 @@ async fn serve() -> i32 {
     };
     if store.is_empty() {
         info!("no secrets resolved for this token — requests pass through unchanged");
+    }
+
+    // Say what response redaction will and will not cover, once, at startup.
+    //
+    // The second half matters more than the first: a value below `min_length` is
+    // skipped because matching it would rewrite unrelated response bytes, and an
+    // operator who is not told that would reasonably assume every secret they can
+    // see is covered.
+    if let Some(redaction) = config.redaction.as_ref() {
+        let short: Vec<&str> = store
+            .names()
+            .filter(|n| store.get(n).is_some_and(|v| v.len() < redaction.min_length))
+            .collect();
+        info!(
+            scan = redaction.scan.as_str(),
+            "scrubbing injected credentials out of upstream responses"
+        );
+        if !short.is_empty() {
+            warn!(
+                secrets = ?short,
+                min_length = redaction.min_length,
+                "these secrets' values are too short to scan responses for — an upstream that \
+                 echoes one back will not be redacted"
+            );
+        }
     }
 
     let store = Arc::new(ArcSwap::from_pointee(store));

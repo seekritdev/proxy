@@ -10,9 +10,11 @@
 //! - **HTTP** arrives as an absolute-form request (`GET http://host/…`). No TLS;
 //!   we substitute (for ruled hosts) and forward.
 //!
-//! The substitution engine, secret store, and allowlist are shared with the
-//! reverse proxy; only the transport differs. Same default-deny guarantee: a
-//! secret is only ever injected toward a host whose rule lists it.
+//! The substitution engine, secret store, allowlist, and response redaction are
+//! shared with the reverse proxy; only the transport differs. Same default-deny
+//! guarantee: a secret is only ever injected toward a host whose rule lists it,
+//! and the same scrub on the way back, so an upstream that echoes a credential
+//! cannot return it to the workload through either plane.
 
 use std::collections::BTreeSet;
 use std::convert::Infallible;
@@ -503,6 +505,7 @@ async fn inject_and_forward(
         { seekrit_telemetry::attr::UPSTREAM_HOST } = %audit_host,
         { seekrit_telemetry::attr::SECRET_NAMES } = tracing::field::Empty,
         { seekrit_telemetry::attr::DENY_REASON } = tracing::field::Empty,
+        { seekrit_telemetry::attr::REDACTION_COUNT } = tracing::field::Empty,
         "http.response.status_code" = tracing::field::Empty,
     );
     seekrit_telemetry::set_parent_context(&span, seekrit_telemetry::extract_context(in_headers));
@@ -652,7 +655,9 @@ async fn inject_and_forward(
         .record_upstream_duration(audit_host, started.elapsed().as_secs_f64() * 1000.0);
     state.metrics.record_request(PLANE_FORWARD, "forwarded");
     span.record("http.response.status_code", resp.status().as_u16());
-    streaming_response(resp)
+
+    let redactor = crate::redact::for_response(state.config.redaction.as_ref(), &injected, store);
+    streaming_response(resp, redactor, state, audit_host, &span)
 }
 
 /// Build a lookup closure over the request's gate + the secret store
@@ -670,18 +675,22 @@ fn mk_lookup<'a>(gate: &'a Gate, store: &'a SecretStore) -> impl Fn(&str) -> Loo
     }
 }
 
-/// Stream a reqwest response back to the client untouched (minus framing headers).
-fn streaming_response(resp: reqwest::Response) -> Response<Body> {
+/// Stream a reqwest response back to the client (minus framing headers), scrubbed
+/// of any credential this request injected.
+///
+/// `redactor = None` is the untouched path — no needles to look for, so the body
+/// is forwarded exactly as it arrives.
+fn streaming_response(
+    resp: reqwest::Response,
+    redactor: Option<Arc<crate::redact::Redactor>>,
+    state: &ForwardState,
+    audit_host: &str,
+    span: &tracing::Span,
+) -> Response<Body> {
     let status = resp.status();
     let resp_headers = resp.headers().clone();
-    let stream = resp
-        .bytes_stream()
-        .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
-    let body = BodyExt::boxed(StreamBody::new(stream));
 
-    let mut out = Response::new(body);
-    *out.status_mut() = status;
-    let h = out.headers_mut();
+    let mut headers = HeaderMap::with_capacity(resp_headers.len());
     for (name, value) in resp_headers.iter() {
         if is_hop_by_hop(name)
             || *name == header::CONTENT_LENGTH
@@ -689,9 +698,59 @@ fn streaming_response(resp: reqwest::Response) -> Response<Body> {
         {
             continue;
         }
-        h.insert(name.clone(), value.clone());
+        headers.append(name.clone(), value.clone());
     }
+
+    let body = match redactor {
+        None => {
+            let stream = resp
+                .bytes_stream()
+                .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+            BodyExt::boxed(StreamBody::new(stream))
+        }
+        Some(redactor) => {
+            // Headers are scrubbed synchronously, while the span is still open —
+            // the body's matches arrive after this function has returned, so they
+            // report through the metric and the audit log instead.
+            let header_hits = crate::redact::redact_headers(&redactor, &mut headers);
+            if header_hits > 0 {
+                span.record(seekrit_telemetry::attr::REDACTION_COUNT, header_hits as i64);
+                state.metrics.record_redactions(audit_host, header_hits);
+                crate::proxy::report_echo(audit_host, redactor.names());
+            }
+            let reporter = echo_reporter(
+                state.metrics.clone(),
+                audit_host.to_string(),
+                redactor.as_ref(),
+            );
+            let stream =
+                crate::redact::redacting_stream(resp.bytes_stream(), redactor.clone(), reporter)
+                    .map(|r| r.map(Frame::data).map_err(|e| Box::new(e) as BoxError));
+            BodyExt::boxed(StreamBody::new(stream))
+        }
+    };
+
+    let mut out = Response::new(body);
+    *out.status_mut() = status;
+    *out.headers_mut() = headers;
     out
+}
+
+/// The `on_hit` callback for a streamed body on this plane. Mirrors the reverse
+/// plane's: one audit line per response, a metric increment per match.
+fn echo_reporter(
+    metrics: Arc<crate::telemetry::Metrics>,
+    host: String,
+    redactor: &crate::redact::Redactor,
+) -> impl Fn(usize) + Send + 'static {
+    let names = redactor.names().to_vec();
+    let reported = std::sync::atomic::AtomicBool::new(false);
+    move |hits: usize| {
+        metrics.record_redactions(&host, hits);
+        if !reported.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::proxy::report_echo(&host, &names);
+        }
+    }
 }
 
 async fn read_limited(body: Incoming, max: usize) -> Result<Bytes, ()> {
