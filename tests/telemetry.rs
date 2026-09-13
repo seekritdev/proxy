@@ -65,12 +65,15 @@ allow = ["{SECRET_NAME}"]
     .expect("valid config");
 
     AppState {
+        client: seekrit_proxy::upstream_client(std::sync::Arc::new(
+            seekrit_proxy::egress::Egress::from_config(&config),
+        ))
+        .unwrap(),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(SecretStore::from_values([(
             SECRET_NAME.to_string(),
             SECRET_VALUE.to_string(),
         )]))),
-        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         // File policy, no tickets: this harness is about what reaches a span.
         policy: None,

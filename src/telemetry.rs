@@ -53,7 +53,8 @@ impl Metrics {
     }
 
     /// One handled request. `outcome` is a fixed set: `forwarded`, `denied`,
-    /// `no_route`, `bad_request`, `upstream_error`.
+    /// `no_route`, `bad_request`, `upstream_error`, `no_policy`, `ratchet`,
+    /// `egress_blocked`.
     pub fn record_request(&self, plane: &'static str, outcome: &'static str) {
         self.requests.add(
             1,

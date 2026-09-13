@@ -20,6 +20,7 @@ use seekrit_cache::{Cache, CacheKey, Lookup};
 use seekrit_proxy::activity::ActivityLog;
 use seekrit_proxy::ca::Ca;
 use seekrit_proxy::config::{CacheConfig, Config};
+use seekrit_proxy::egress::Egress;
 use seekrit_proxy::forward::{self, ForwardState};
 use seekrit_proxy::policy::{self, PolicyCache};
 use seekrit_proxy::proxy::{router, AppState};
@@ -169,12 +170,25 @@ async fn serve() -> i32 {
         .or_else(|| env_nonempty("SEEKRIT_API_URL"))
         .unwrap_or_else(|| DEFAULT_API_URL.to_string());
 
-    // One place decides how this client is built — see `upstream_client`; the
-    // headline is that an upstream redirect is never followed.
-    let client = match seekrit_proxy::upstream_client() {
+    // Where this proxy may connect, as opposed to what it may inject. Built
+    // before either client because it *is* the data plane's DNS resolver.
+    let egress = Arc::new(Egress::from_config(&config));
+
+    // Two clients, because they answer to different rules. The data plane's goes
+    // through the egress gate and never follows a redirect; the control plane's
+    // talks to an API whose address is operator configuration, not an agent's
+    // choice. See `upstream_client` / `api_client`.
+    let client = match seekrit_proxy::upstream_client(egress.clone()) {
         Ok(c) => c,
         Err(e) => {
             error!("could not build HTTP client: {e}");
+            return 1;
+        }
+    };
+    let api = match seekrit_proxy::api_client() {
+        Ok(c) => c,
+        Err(e) => {
+            error!("could not build API client: {e}");
             return 1;
         }
     };
@@ -194,7 +208,7 @@ async fn serve() -> i32 {
         });
 
     // Fail-closed: resolve + decrypt up front. No secrets → nothing to inject.
-    let (store, degraded) = match resolve_live(&client, &api_url, &token, lkg.as_ref()).await {
+    let (store, degraded) = match resolve_live(&api, &api_url, &token, lkg.as_ref()).await {
         Ok(store) => (store, false),
         Err(e) => match cached_store(lkg.as_ref(), &e, &token) {
             Some(store) => (store, true),
@@ -206,6 +220,22 @@ async fn serve() -> i32 {
     };
     if store.is_empty() {
         info!("no secrets resolved for this token — requests pass through unchanged");
+    }
+
+    // The egress gate, once, at startup. Worth a line even when it is simply on:
+    // the exempt set is derived rather than written down, so an operator
+    // wondering why their sidecar upstream still works should be able to see why.
+    if egress.is_enforcing() {
+        info!(
+            exempt = ?config.routes.iter().map(|r| r.host.as_str()).collect::<Vec<_>>(),
+            "refusing outbound connections to private, loopback, and link-local addresses \
+             (configured route upstreams are exempt; widen with [egress] allow_cidr)"
+        );
+    } else {
+        warn!(
+            "[egress] block_private_ips = false — this proxy will connect to any address an \
+             agent names, including cloud instance metadata"
+        );
     }
 
     // Say what response redaction will and will not cover, once, at startup.
@@ -246,7 +276,7 @@ async fn serve() -> i32 {
         if let (Some(lkg), Some(cache_config)) = (lkg, config.cache.as_ref()) {
             tokio::spawn(reconnect(
                 store.clone(),
-                client.clone(),
+                api.clone(),
                 api_url.clone(),
                 token.clone(),
                 lkg,
@@ -282,7 +312,7 @@ async fn serve() -> i32 {
         None
     };
     let policy_store = if config.policy.is_server() {
-        match policy::load_all(&client, &api_url, &token, &config, policy_cache.as_deref()).await {
+        match policy::load_all(&api, &api_url, &token, &config, policy_cache.as_deref()).await {
             Ok((store, etags)) => {
                 let store = Arc::new(store);
                 if let Some(window) = policy::soonest_expiry(&store, policy::now_secs()) {
@@ -294,7 +324,7 @@ async fn serve() -> i32 {
                 tokio::spawn(
                     policy::Refresher {
                         store: store.clone(),
-                        client: client.clone(),
+                        client: api.clone(),
                         api_url: api_url.clone(),
                         token: token.clone(),
                         config: config.clone(),
@@ -324,7 +354,7 @@ async fn serve() -> i32 {
         );
         tokio::spawn(refresh_secrets(
             store.clone(),
-            client.clone(),
+            api.clone(),
             api_url.clone(),
             token.clone(),
             interval,
@@ -396,7 +426,7 @@ async fn serve() -> i32 {
             "honouring tasks dispatched through the API (skd_… in the ticket header)"
         );
         TaskClient::new(
-            client.clone(),
+            api.clone(),
             api_url.clone(),
             token.clone(),
             known,
@@ -443,7 +473,7 @@ async fn serve() -> i32 {
             .map(|s| s.version);
         tasks.push(tokio::spawn(seekrit_proxy::activity::flush_loop(
             log,
-            client.clone(),
+            api.clone(),
             api_url.clone(),
             token.clone(),
             agent,
@@ -517,6 +547,7 @@ async fn serve() -> i32 {
             config: config.clone(),
             store: store.clone(),
             client: client.clone(),
+            egress: egress.clone(),
             ca,
             metrics: metrics.clone(),
             policy: policy_store.clone(),

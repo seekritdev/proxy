@@ -95,9 +95,12 @@ async fn harness() -> (String, Hits) {
     let config = Config::from_toml(&cfg).unwrap();
     let store = SecretStore::from_values([("TEST_KEY".to_string(), "s3cr3t-value".to_string())]);
     let state = AppState {
+        client: seekrit_proxy::upstream_client(std::sync::Arc::new(
+            seekrit_proxy::egress::Egress::from_config(&config),
+        ))
+        .unwrap(),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store)),
-        client: seekrit_proxy::upstream_client().unwrap(),
         // No exporter configured in tests, so these instruments are no-ops.
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         // These harnesses exercise file policy: no server bundles, no tickets.
@@ -217,9 +220,12 @@ async fn harness_with(
         ("OTHER_KEY".to_string(), "other-value".to_string()),
     ]);
     let state = AppState {
+        client: seekrit_proxy::upstream_client(std::sync::Arc::new(
+            seekrit_proxy::egress::Egress::from_config(&config),
+        ))
+        .unwrap(),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store)),
-        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: policy_for(&upstream),
         sessions: Arc::new(SessionResolver::new(tickets, None)),
@@ -515,12 +521,15 @@ async fn the_ticket_header_never_reaches_the_upstream() {
     ))
     .unwrap();
     let state = AppState {
+        client: seekrit_proxy::upstream_client(std::sync::Arc::new(
+            seekrit_proxy::egress::Egress::from_config(&config),
+        ))
+        .unwrap(),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(SecretStore::from_values([(
             "TEST_KEY".to_string(),
             "s3cr3t-value".to_string(),
         )]))),
-        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: None,
         sessions: Arc::new(SessionResolver::new(Some(tickets), None)),
@@ -576,12 +585,15 @@ async fn the_ratchet_withdraws_a_host_after_a_protected_request() {
     .unwrap();
     let ratchet = Arc::new(RatchetStore::new(config.ratchet.clone().unwrap()));
     let state = AppState {
+        client: seekrit_proxy::upstream_client(std::sync::Arc::new(
+            seekrit_proxy::egress::Egress::from_config(&config),
+        ))
+        .unwrap(),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(SecretStore::from_values([(
             "TEST_KEY".to_string(),
             "s3cr3t-value".to_string(),
         )]))),
-        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: None,
         sessions: Arc::new(SessionResolver::new(None, None)),
@@ -717,12 +729,15 @@ async fn a_dispatched_task_narrows_the_run_and_is_introspected_once() {
         std::time::Duration::from_secs(60),
     );
     let state = AppState {
+        client: seekrit_proxy::upstream_client(std::sync::Arc::new(
+            seekrit_proxy::egress::Egress::from_config(&config),
+        ))
+        .unwrap(),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(SecretStore::from_values([
             ("TEST_KEY".to_string(), "s3cr3t-value".to_string()),
             ("OTHER_KEY".to_string(), "other-value".to_string()),
         ]))),
-        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: std::sync::Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: None,
         sessions: Arc::new(SessionResolver::new(None, Some(tasks))),

@@ -10,6 +10,12 @@
 //! - **HTTP** arrives as an absolute-form request (`GET http://host/…`). No TLS;
 //!   we substitute (for ruled hosts) and forward.
 //!
+//! Every destination on this plane is chosen by the agent, so it is also the
+//! plane that needs [`crate::egress`]: a rule permitting `evil.test` is a route
+//! to the instance-metadata service the moment that name resolves there. The
+//! address check runs on the `CONNECT` target, on an absolute-form host, and on
+//! the far end of a blind tunnel.
+//!
 //! The substitution engine, secret store, allowlist, and response redaction are
 //! shared with the reverse proxy; only the transport differs. Same default-deny
 //! guarantee: a secret is only ever injected toward a host whose rule lists it,
@@ -73,6 +79,10 @@ pub struct ForwardState {
     /// Aggregate decision counts, shared with the reverse plane — one ledger per
     /// proxy, so a review sees both planes' traffic together.
     pub activity: Option<Arc<ActivityLog>>,
+    /// Which addresses this proxy may connect to. Also installed as
+    /// [`Self::client`]'s DNS resolver, which is what pins a hostname's approved
+    /// addresses to the ones actually dialled.
+    pub egress: Arc<crate::egress::Egress>,
 }
 
 impl ForwardState {
@@ -295,6 +305,19 @@ fn handle_connect(req: Request<Incoming>, state: ForwardState) -> Response<Body>
     let host = authority.host().to_ascii_lowercase();
     let port = authority.port_u16().unwrap_or(443);
 
+    // A literal address never reaches a resolver, so this is the only place that
+    // can catch `CONNECT 169.254.169.254:80`. A *hostname* passes here and is
+    // enforced where it is resolved: the client's own resolver on the MITM path,
+    // and `blind_tunnel` below. Both dial the addresses they approved, so there
+    // is no second lookup for a rebind to land in.
+    if let Err(e) = state.egress.check_literal(&host) {
+        warn!(reason = "egress_blocked", "denied: {e}");
+        state
+            .metrics
+            .record_request(PLANE_FORWARD, "egress_blocked");
+        return text(StatusCode::FORBIDDEN, &e.to_string());
+    }
+
     let is_ruled = state.intercepts(&host);
     if is_ruled {
         // MITM: on upgrade, terminate TLS with a minted cert and serve.
@@ -320,10 +343,13 @@ fn handle_connect(req: Request<Incoming>, state: ForwardState) -> Response<Body>
         ),
         UnmatchedPolicy::Tunnel => {
             // Blind-tunnel: never decrypt, just splice bytes to the real host.
+            // Never decrypted is not never checked — an unruled host is exactly
+            // where an agent would point a tunnel at something internal.
+            let egress = state.egress.clone();
             tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
-                        if let Err(e) = blind_tunnel(upgraded, host, port).await {
+                        if let Err(e) = blind_tunnel(upgraded, host, port, egress).await {
                             debug!("tunnel ended: {e}");
                         }
                     }
@@ -360,9 +386,22 @@ async fn mitm_serve(
 }
 
 /// Splice an unmatched CONNECT tunnel straight to its destination, untouched.
-async fn blind_tunnel(upgraded: Upgraded, host: String, port: u16) -> std::io::Result<()> {
+///
+/// The gate resolves the name and hands back the addresses it approved, and those
+/// are what get dialled — resolving again here would hand a rebind exactly the
+/// window this is meant to close.
+async fn blind_tunnel(
+    upgraded: Upgraded,
+    host: String,
+    port: u16,
+    egress: Arc<crate::egress::Egress>,
+) -> std::io::Result<()> {
+    let addrs = egress
+        .resolve(&host, port)
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let mut client = TokioIo::new(upgraded);
-    let mut server = TcpStream::connect((host.as_str(), port)).await?;
+    let mut server = TcpStream::connect(&addrs[..]).await?;
     tokio::io::copy_bidirectional(&mut client, &mut server).await?;
     Ok(())
 }
@@ -434,6 +473,15 @@ async fn handle_absolute_http(req: Request<Incoming>, state: ForwardState) -> Re
         );
     }
     let host = host.to_ascii_lowercase();
+    // `GET http://169.254.169.254/latest/meta-data/` — the plainest form of the
+    // attack, and one that consults no resolver at all.
+    if let Err(e) = state.egress.check_literal(&host) {
+        warn!(reason = "egress_blocked", "denied: {e}");
+        state
+            .metrics
+            .record_request(PLANE_FORWARD, "egress_blocked");
+        return text(StatusCode::FORBIDDEN, &e.to_string());
+    }
     let authority = match uri.port_u16() {
         Some(p) => format!("{host}:{p}"),
         None => host.clone(),
@@ -646,7 +694,7 @@ async fn inject_and_forward(
                 .record_request(PLANE_FORWARD, "upstream_error");
             return text(
                 StatusCode::BAD_GATEWAY,
-                &format!("upstream request failed: {e}"),
+                &format!("upstream request failed: {}", crate::describe_error(&e)),
             );
         }
     };

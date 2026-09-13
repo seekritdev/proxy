@@ -186,6 +186,10 @@ async fn http_forward_substitutes_matched_host() {
         .build()
         .unwrap();
     let state = ForwardState {
+        // The gate this config describes, exactly as `main.rs` builds it: these
+        // configs name no routes, so nothing is exempt and the address check is
+        // live for every host the agent asks for.
+        egress: Arc::new(seekrit_proxy::egress::Egress::from_config(&config)),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store())),
         client,
@@ -240,6 +244,10 @@ async fn http_forward_denies_unmatched_host() {
         .build()
         .unwrap();
     let state = ForwardState {
+        // The gate this config describes, exactly as `main.rs` builds it: these
+        // configs name no routes, so nothing is exempt and the address check is
+        // live for every host the agent asks for.
+        egress: Arc::new(seekrit_proxy::egress::Egress::from_config(&config)),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store())),
         client,
@@ -278,6 +286,10 @@ async fn https_mitm_substitutes_and_forwards() {
         .build()
         .unwrap();
     let state = ForwardState {
+        // The gate this config describes, exactly as `main.rs` builds it: these
+        // configs name no routes, so nothing is exempt and the address check is
+        // live for every host the agent asks for.
+        egress: Arc::new(seekrit_proxy::egress::Egress::from_config(&config)),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store())),
         client: proxy_client,
@@ -335,6 +347,10 @@ async fn http_forward_enforces_operation_constraints_on_a_ruled_host() {
         .build()
         .unwrap();
     let state = ForwardState {
+        // The gate this config describes, exactly as `main.rs` builds it: these
+        // configs name no routes, so nothing is exempt and the address check is
+        // live for every host the agent asks for.
+        egress: Arc::new(seekrit_proxy::egress::Egress::from_config(&config)),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store())),
         client,

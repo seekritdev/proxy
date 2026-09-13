@@ -66,6 +66,7 @@ struct RawConfig {
     ratchet: Option<RawRatchet>,
     activity: Option<RawActivity>,
     redaction: Option<RawRedaction>,
+    egress: Option<RawEgress>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +170,13 @@ struct RawActivity {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawEgress {
+    block_private_ips: Option<bool>,
+    #[serde(default)]
+    allow_cidr: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct RawRedaction {
     enabled: Option<bool>,
     scan: Option<String>,
@@ -263,6 +271,14 @@ pub struct Config {
     /// is no scanner, and the response streams through on the same path it took
     /// before this existed.
     pub redaction: Option<crate::redact::RedactionConfig>,
+    /// Which *addresses* this proxy may connect to.
+    ///
+    /// The allowlist bounds names; this bounds destinations. Enforcing by
+    /// default, like `[redaction]`, because a rule permitting `evil.test` is a
+    /// route to the instance-metadata service the moment that name resolves
+    /// there — and the operator who most needs the check is the one who never
+    /// read about it.
+    pub egress: crate::egress::EgressConfig,
 }
 
 /// The validated `[activity]` block.
@@ -439,6 +455,7 @@ pub enum ConfigError {
     Ratchet(String),
     Activity(String),
     Redaction(String),
+    Egress(String),
 }
 
 impl std::fmt::Display for ConfigError {
@@ -457,6 +474,7 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Ratchet(m) => write!(f, "invalid [ratchet] config: {m}"),
             ConfigError::Activity(m) => write!(f, "invalid [activity] config: {m}"),
             ConfigError::Redaction(m) => write!(f, "invalid [redaction] config: {m}"),
+            ConfigError::Egress(m) => write!(f, "invalid [egress] config: {m}"),
         }
     }
 }
@@ -549,6 +567,7 @@ impl Config {
         let activity = raw.activity.map(ActivityConfig::validate).transpose()?;
         let ratchet = raw.ratchet.map(validate_ratchet).transpose()?;
         let redaction = validate_redaction(raw.redaction)?;
+        let egress = validate_egress(raw.egress)?;
 
         Ok(Config {
             listen,
@@ -566,6 +585,7 @@ impl Config {
             ratchet,
             activity,
             redaction,
+            egress,
         })
     }
 
@@ -805,6 +825,39 @@ impl TasksConfig {
         }
         Ok(TasksConfig { cache_ttl })
     }
+}
+
+/// Validate `[egress]` — or synthesise the enforcing default when it is absent.
+///
+/// `allow_cidr` is parsed here rather than at connect time for the usual reason:
+/// a typo in a range is a control that quietly does not cover what its author
+/// thinks it covers, and the only safe moment to find that out is before the
+/// proxy is serving anything.
+fn validate_egress(raw: Option<RawEgress>) -> Result<crate::egress::EgressConfig, ConfigError> {
+    use crate::egress::{Cidr, EgressConfig};
+
+    let Some(raw) = raw else {
+        return Ok(EgressConfig::default());
+    };
+    let mut allow = Vec::with_capacity(raw.allow_cidr.len());
+    for entry in &raw.allow_cidr {
+        allow.push(Cidr::parse(entry).map_err(ConfigError::Egress)?);
+    }
+    let block_private = raw.block_private_ips.unwrap_or(true);
+    if !block_private && !allow.is_empty() {
+        // Both settings mean "reach this network", and one of them is doing
+        // nothing. Saying so beats leaving an operator to believe the narrow one
+        // is in force.
+        return Err(ConfigError::Egress(
+            "allow_cidr has no effect when block_private_ips = false — everything is already \
+             permitted. Drop one of the two."
+                .into(),
+        ));
+    }
+    Ok(EgressConfig {
+        block_private,
+        allow,
+    })
 }
 
 /// Validate `[redaction]` — or synthesise the default when the block is absent.
@@ -1238,6 +1291,70 @@ mod tests {
         assert!(c.policy.signers.is_empty());
         assert!(c.secrets.refresh_interval.is_none());
         assert!(c.control.is_none());
+    }
+
+    #[test]
+    fn the_egress_gate_is_on_without_being_asked_for() {
+        // Like [redaction]: the operator who most needs the address check is the
+        // one who never read that it exists.
+        let c = cfg("[[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(c.egress.block_private);
+        assert!(c.egress.allow.is_empty());
+    }
+
+    #[test]
+    fn egress_allow_cidr_is_parsed_at_startup() {
+        // Not at connect time: a typo in a range is a control that silently does
+        // not cover what its author thinks, and 3am is the wrong time to find out.
+        let c = cfg("[egress]\nallow_cidr=['10.0.0.0/8','192.168.1.5']\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert_eq!(c.egress.allow.len(), 2);
+
+        let bad = err("[egress]\nallow_cidr=['10.0.0.0/33']\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(bad.contains("/33"), "{bad}");
+    }
+
+    #[test]
+    fn the_egress_gate_can_be_turned_off() {
+        let c = cfg("[egress]\nblock_private_ips=false\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(!c.egress.block_private);
+    }
+
+    #[test]
+    fn a_contradictory_egress_block_is_refused() {
+        // Both settings mean "reach this network" and one of them is inert;
+        // leaving it would let an operator believe the narrow one is in force.
+        let bad = err(
+            "[egress]\nblock_private_ips=false\nallow_cidr=['10.0.0.0/8']\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n",
+        );
+        assert!(bad.contains("no effect"), "{bad}");
+    }
+
+    #[test]
+    fn route_upstreams_are_the_exempt_set() {
+        // What makes an on-by-default address check safe to ship: the operator's
+        // own upstream is not an agent-chosen destination.
+        let c = cfg("[[route]]\nprefix='/x'\nupstream='http://127.0.0.1:9000'\n\
+             [[route]]\nprefix='/y'\nupstream='https://api.example.com'\n");
+        let gate = crate::egress::Egress::from_config(&c);
+        assert!(gate.is_exempt("127.0.0.1"));
+        assert!(gate.is_exempt("api.example.com"));
+        assert!(!gate.is_exempt("169.254.169.254"));
+        assert!(gate.check_literal("127.0.0.1").is_ok());
+        assert!(gate.check_literal("10.0.0.1").is_err());
+    }
+
+    #[test]
+    fn a_forward_host_rule_is_not_exempt() {
+        // A host rule says an agent *may* name that host; the name is still
+        // resolved at the agent's request, so the address check still applies.
+        let c = cfg("[forward]\nlisten='127.0.0.1:8081'\n\
+             [[forward.host]]\nmatch='internal.corp'\n");
+        let gate = crate::egress::Egress::from_config(&c);
+        assert!(!gate.is_exempt("internal.corp"));
     }
 
     #[test]

@@ -55,9 +55,12 @@ async fn proxy_for(upstream: SocketAddr, redaction: &str) -> String {
         ("OTHER_KEY".to_string(), OTHER.to_string()),
     ]);
     let state = AppState {
+        client: seekrit_proxy::upstream_client(std::sync::Arc::new(
+            seekrit_proxy::egress::Egress::from_config(&config),
+        ))
+        .unwrap(),
         config: Arc::new(config),
         store: Arc::new(ArcSwap::from_pointee(store)),
-        client: seekrit_proxy::upstream_client().unwrap(),
         metrics: Arc::new(seekrit_proxy::telemetry::Metrics::new()),
         policy: None,
         sessions: Arc::new(SessionResolver::new(None, None)),

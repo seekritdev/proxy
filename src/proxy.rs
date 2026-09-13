@@ -503,7 +503,7 @@ async fn forward(state: AppState, req: Request, span: &tracing::Span) -> Result<
         .body(body_out.bytes)
         .send()
         .await
-        .map_err(|e| Reject::Upstream(e.to_string()))?;
+        .map_err(|e| Reject::Upstream(crate::describe_error(&e)))?;
     state
         .metrics
         .record_upstream_duration(&route.host, started.elapsed().as_secs_f64() * 1000.0);
