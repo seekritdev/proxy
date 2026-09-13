@@ -19,42 +19,17 @@ methods = ["GET", "POST"]
 paths = ["/v1/**"]
 label = "OpenAI API (api.openai.com)"
 
-[forward]
-listen = "127.0.0.1:8081"
-unmatched_host_policy = "tunnel"
-ca_cert = "seekrit-proxy-ca.pem"
-ca_key = "seekrit-proxy-ca-key.pem"
-
-[[forward.host]]
-match = "api.openai.com"
-allow = ["OPENAI_API_KEY"]
-methods = ["GET", "POST"]
-paths = ["/v1/**"]
-label = "OpenAI API (api.openai.com)"
-
-# Re-resolve on an interval, so a secret added later reaches a running proxy.
-# No new grant is involved: a new secret in an environment this proxy already
-# has a key grant for decrypts with the key it already holds.
-[secrets]
-refresh_interval = "30s"
-
-# Start on the last (encrypted) resolve response if the API is unreachable.
-# A *refused* resolve still fails closed, and decrypting a cached entry still
-# needs this proxy's service token.
-[cache]
-enabled = true
-max_age = "6h"
-
 # One proxy fronting several agents: the orchestrator mints a ticket per
 # agent. Requires SEEKRIT_PROXY_CONTROL_TOKEN in the environment, and that
 # token must not be readable by the agents.
 [control]
-listen = "127.0.0.1:9090"
+socket = "/run/seekrit/control.sock"
 ttl = "1h"
 max_ttl = "12h"
-# A TCP control listener carries no peer credentials, so the token is the
-# only gate — and an agent spawned by the orchestrator inherits it. Use a
-# Unix socket (--control /run/seekrit/control.sock) to attest the caller.
+# Only this program may mint tickets and decide held requests. Without it,
+# any process running as your user and holding the control token can.
+# allow_binary = ["/usr/local/bin/your-orchestrator"]
+# allow_sha256 = ["<sha256 of that binary>"]
 
 # ---------------------------------------------------------------------------
 # Point the workload at the proxy (these go in its environment, not here):

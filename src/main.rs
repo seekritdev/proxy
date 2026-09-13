@@ -23,6 +23,10 @@ use seekrit_proxy::ca::Ca;
 use seekrit_proxy::config::{CacheConfig, Config};
 use seekrit_proxy::egress::Egress;
 use seekrit_proxy::forward::{self, ForwardState};
+// Only the Unix control socket builds one; on other platforms the import would
+// be dead.
+#[cfg(unix)]
+use seekrit_proxy::peer::PeerPolicy;
 use seekrit_proxy::policy::{self, PolicyCache};
 use seekrit_proxy::proxy::{router, AppState};
 use seekrit_proxy::ratchet::RatchetStore;
@@ -412,28 +416,49 @@ async fn serve() -> i32 {
                 vec![DEFAULT_FILE_AGENT.to_string()]
             };
             let tickets = Arc::new(TicketStore::new(agents, control.ttl, control.max_ttl));
-            let listener = match tokio::net::TcpListener::bind(control.listen).await {
-                Ok(l) => l,
-                Err(e) => {
-                    error!("could not bind control listener {}: {e}", control.listen);
-                    return 1;
-                }
-            };
-            info!(listen = %control.listen, "control listener ready (POST /session to mint a ticket; GET /approvals to see what is held)");
             let state = ControlState {
                 tickets: tickets.clone(),
                 token: Arc::new(control_token),
                 approvals: approvals.clone(),
             };
-            let sd = shutdown(rx.clone());
-            tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, control_router(state))
-                    .with_graceful_shutdown(sd)
-                    .await
-                {
-                    error!("control server error: {e}");
+
+            // The attested transport, when one is configured. Unix only:
+            // peer credentials belong to a socket, and config validation has
+            // already refused `socket` on platforms without one.
+            if let Some(path) = control.socket.as_deref() {
+                if let Err(e) = spawn_control_socket(path, control, state.clone(), rx.clone()) {
+                    error!("{e}");
+                    return 1;
                 }
-            });
+            }
+
+            if let Some(addr) = control.listen {
+                let listener = match tokio::net::TcpListener::bind(addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        error!("could not bind control listener {addr}: {e}");
+                        return 1;
+                    }
+                };
+                if control.socket.is_some() {
+                    warn!(
+                        listen = %addr,
+                        "this control listener is also on TCP, where the caller cannot be \
+                         attested — any local process with the control token can use it"
+                    );
+                } else {
+                    info!(listen = %addr, "control listener ready (POST /session to mint a ticket; GET /approvals to see what is held)");
+                }
+                let sd = shutdown(rx.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(listener, control_router(state))
+                        .with_graceful_shutdown(sd)
+                        .await
+                    {
+                        error!("control server error: {e}");
+                    }
+                });
+            }
             Some(tickets)
         }
         None => None,
@@ -610,6 +635,124 @@ async fn serve() -> i32 {
         let _ = t.await;
     }
     0
+}
+
+/// Bind and serve the attested control socket.
+///
+/// Split out so the call site stays platform-agnostic: `tokio::net::UnixListener`
+/// does not exist on Windows, and a `#[cfg]` around the whole block inside
+/// `serve` would have to repeat its state plumbing.
+#[cfg(unix)]
+fn spawn_control_socket(
+    path: &str,
+    control: &seekrit_proxy::config::ControlConfig,
+    state: ControlState,
+    rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    let listener = bind_control_socket(path)?;
+    let policy = Arc::new(PeerPolicy::from_control(
+        control,
+        seekrit_proxy::peer::own_uid(),
+    ));
+    if policy.attests_binary() {
+        info!(
+            socket = %path,
+            uids = ?policy.uids,
+            programs = policy.binaries.len() + policy.digests.len(),
+            "control socket ready, admitting only allow-listed programs"
+        );
+    } else {
+        // Worth saying out loud: a uid-only policy cannot tell an orchestrator
+        // from the agent it spawned, which is the case the socket exists for.
+        info!(
+            socket = %path,
+            uids = ?policy.uids,
+            "control socket ready; no allow_binary/allow_sha256, so any program running as a \
+             permitted uid may mint tickets and decide held requests"
+        );
+    }
+    let sd = shutdown(rx);
+    let router = control_router(state);
+    let cleanup = path.to_string();
+    tokio::spawn(async move {
+        seekrit_proxy::peer::serve_attested(listener, policy, router, sd).await;
+        // Leaving the node behind makes the next start look like a collision
+        // rather than a clean restart.
+        let _ = std::fs::remove_file(&cleanup);
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn spawn_control_socket(
+    path: &str,
+    _control: &seekrit_proxy::config::ControlConfig,
+    _state: ControlState,
+    _rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<(), String> {
+    // Unreachable: config validation refuses `socket` on this platform. Stated
+    // rather than `unreachable!()` so a future platform gets an error, not a panic.
+    Err(format!(
+        "[control] socket ({path}) is not supported on this platform"
+    ))
+}
+
+/// Bind the control socket, cleaning up a node left by a dead proxy.
+///
+/// Two details this gets deliberately careful about:
+///
+/// - **A stale node is only removed once we know nothing is listening on it.**
+///   Unlinking blindly would let a second proxy steal a running one's socket, and
+///   the failure would be silent — the orchestrator keeps connecting, to the
+///   wrong process.
+/// - **Permissions are set to `0600` immediately.** The socket is what mints
+///   tickets and releases held requests; the filesystem is the first gate, and
+///   peer attestation is the second. A socket created under a permissive umask
+///   would be reachable by every user on the machine until the second gate caught
+///   them.
+#[cfg(unix)]
+fn bind_control_socket(path: &str) -> Result<tokio::net::UnixListener, String> {
+    if let Some(parent) = std::path::Path::new(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "could not create {} for the control socket: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+    }
+
+    match tokio::net::UnixListener::bind(path) {
+        Ok(listener) => set_socket_mode(path, listener),
+        Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+            // Connectable means a live proxy owns it; refusing is the only safe
+            // answer. Otherwise it is a leftover and may be replaced.
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
+                return Err(format!(
+                    "another process is already serving the control socket at {path}"
+                ));
+            }
+            std::fs::remove_file(path)
+                .map_err(|e| format!("could not remove the stale control socket {path}: {e}"))?;
+            let listener = tokio::net::UnixListener::bind(path)
+                .map_err(|e| format!("could not bind the control socket {path}: {e}"))?;
+            set_socket_mode(path, listener)
+        }
+        Err(e) => Err(format!("could not bind the control socket {path}: {e}")),
+    }
+}
+
+#[cfg(unix)]
+fn set_socket_mode(
+    path: &str,
+    listener: tokio::net::UnixListener,
+) -> Result<tokio::net::UnixListener, String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("could not restrict permissions on {path}: {e}"))?;
+    Ok(listener)
 }
 
 /// An opened last-known-good cache, bound to this proxy's exact resolve request.

@@ -29,10 +29,22 @@ fn fixture_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/generated-configs")
 }
 
-fn load(name: &str) -> Config {
+fn read(name: &str) -> String {
     let path = fixture_dir().join(name);
-    let text = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    Config::from_toml(&text).unwrap_or_else(|e| panic!("{name} did not parse: {e:?}"))
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
+fn load(name: &str) -> Config {
+    Config::from_toml(&read(name)).unwrap_or_else(|e| panic!("{name} did not parse: {e:?}"))
+}
+
+/// `[control] socket` is a Unix transport, and the parser refuses it elsewhere
+/// rather than downgrading to the token alone. A generated config that names one
+/// is therefore *expected* to be rejected on Windows — so the assertion flips
+/// there rather than the file being skipped, which would let a genuinely broken
+/// fixture pass unnoticed.
+fn names_a_control_socket(text: &str) -> bool {
+    text.lines().any(|l| l.trim_start().starts_with("socket"))
 }
 
 #[test]
@@ -48,7 +60,18 @@ fn every_generated_config_parses() {
         // Parsing is the assertion: `from_toml` validates listen addresses,
         // upstream URLs, route prefixes, duration strings, and the file/server
         // rule split, so a config that survives it is one that would start.
-        load(name);
+        let text = read(name);
+        if cfg!(windows) && names_a_control_socket(&text) {
+            let refused = Config::from_toml(&text)
+                .expect_err("a control socket is not a Windows transport")
+                .to_string();
+            assert!(
+                refused.contains("not supported on Windows"),
+                "{name} should be refused for the platform, not something else: {refused}"
+            );
+        } else {
+            load(name);
+        }
         seen += 1;
     }
     // A silently empty fixture directory would make this whole file vacuous.
@@ -208,9 +231,22 @@ fn the_optional_blocks_survive_the_round_trip() {
     let cache = config.cache.as_ref().expect("[cache] block");
     assert_eq!(cache.max_age.as_secs(), 6 * 60 * 60);
     let control = config.control.as_ref().expect("[control] block");
-    assert_eq!(control.listen.to_string(), "127.0.0.1:9090");
+    assert_eq!(control.listen.unwrap().to_string(), "127.0.0.1:9090");
     assert_eq!(
         config.secrets.refresh_interval.map(|d| d.as_secs()),
         Some(30)
     );
+}
+
+/// A generated control socket has to survive the round trip too — and it has to
+/// be *only* a socket. If the generator also emitted a TCP address, the config
+/// would open an unattestable listener beside the attested one, which is what
+/// choosing the socket was meant to avoid.
+#[cfg(unix)]
+#[test]
+fn a_generated_control_socket_is_the_only_control_transport() {
+    let config = load("presets-control-socket.toml");
+    let control = config.control.as_ref().expect("[control] block");
+    assert_eq!(control.socket.as_deref(), Some("/run/seekrit/control.sock"));
+    assert!(control.listen.is_none(), "no TCP port alongside the socket");
 }

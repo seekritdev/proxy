@@ -11,6 +11,7 @@ pub mod ca;
 pub mod config;
 pub mod egress;
 pub mod forward;
+pub mod peer;
 pub mod policy;
 pub mod proxy;
 pub mod ratchet;

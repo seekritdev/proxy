@@ -70,7 +70,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 # CONNECT and serve HTTP over the MITM'd TLS stream, rustls to terminate it, and
 # rcgen to mint per-host leaf certs from a local CA.
 hyper = { version = "1", features = ["server", "http1"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
 http-body-util = "0.1"
 futures-util = "0.3"
 bytes = "1"
@@ -82,6 +82,11 @@ rcgen = "0.13"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+
+# Peer attestation on the control listener: the calling binary is hashed, and
+# macOS needs libproc to resolve a pid to its executable (Linux reads /proc).
+libc = "0.2"
+sha2 = "0.11"
 
 # Observability + secret hygiene. The subscriber itself is installed by
 # seekrit-telemetry, so only the facade is needed here.

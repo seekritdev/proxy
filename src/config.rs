@@ -150,8 +150,17 @@ struct RawCeilingEntry {
 #[derive(Debug, Deserialize)]
 struct RawControl {
     listen: Option<String>,
+    /// Unix socket path. The only transport peer attestation can run on.
+    socket: Option<String>,
     ttl: Option<String>,
     max_ttl: Option<String>,
+    /// uids permitted to connect. Absent ⇒ the proxy's own uid.
+    #[serde(default)]
+    allow_uid: Option<Vec<u32>>,
+    #[serde(default)]
+    allow_binary: Vec<String>,
+    #[serde(default)]
+    allow_sha256: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -399,15 +408,45 @@ impl PolicyConfig {
     }
 }
 
-/// The validated `[control]` block: a loopback listener that mints session
-/// tickets for an orchestrator (never for the agent itself).
+/// The validated `[control]` block: the listener that mints session tickets for
+/// an orchestrator (never for the agent itself) and decides held requests.
 #[derive(Debug, Clone)]
 pub struct ControlConfig {
-    pub listen: SocketAddr,
+    /// TCP address, when one is configured.
+    ///
+    /// `None` when `socket` is set and no `listen` was asked for: naming a socket
+    /// is a request for the attested transport, and quietly also opening a TCP
+    /// port that nothing can attest would hand back exactly what the socket was
+    /// chosen to avoid.
+    pub listen: Option<SocketAddr>,
+    /// Unix socket path, when one is configured. The only transport on which
+    /// [`crate::peer`] can tell an orchestrator from the agent it spawned.
+    pub socket: Option<String>,
     /// Default ticket lifetime when a request does not ask for one.
     pub ttl: Duration,
     /// The longest lifetime the control listener will mint.
     pub max_ttl: Duration,
+    /// uids permitted on the socket. `None` ⇒ the proxy's own, filled in at
+    /// startup: `from_toml` stays pure, so a config's meaning does not depend on
+    /// which user parsed it.
+    pub allow_uid: Option<Vec<u32>>,
+    /// Absolute paths of programs permitted on the socket.
+    pub allow_binary: Vec<std::path::PathBuf>,
+    /// Permitted executable digests, lowercase hex SHA-256.
+    pub allow_sha256: Vec<String>,
+}
+
+impl ControlConfig {
+    /// Does this listener check *which program* is calling, rather than only
+    /// which user?
+    pub fn attests_binary(&self) -> bool {
+        !self.allow_binary.is_empty() || !self.allow_sha256.is_empty()
+    }
+
+    /// Every address this listener occupies, for the collision checks.
+    fn addrs(&self) -> impl Iterator<Item = SocketAddr> + '_ {
+        self.listen.into_iter()
+    }
 }
 
 /// The validated `[secrets]` block: periodic re-resolve.
@@ -568,16 +607,19 @@ impl Config {
 
         let control = raw.control.map(ControlConfig::validate).transpose()?;
         if let Some(control) = &control {
-            if control.listen == listen {
-                return Err(ConfigError::Control(
-                    "control listen collides with the reverse-proxy listen; use different ports"
-                        .into(),
-                ));
-            }
-            if forward.as_ref().is_some_and(|f| f.listen == control.listen) {
-                return Err(ConfigError::Control(
-                    "control listen collides with the forward listen; use different ports".into(),
-                ));
+            for addr in control.addrs() {
+                if addr == listen {
+                    return Err(ConfigError::Control(
+                        "control listen collides with the reverse-proxy listen; use different ports"
+                            .into(),
+                    ));
+                }
+                if forward.as_ref().is_some_and(|f| f.listen == addr) {
+                    return Err(ConfigError::Control(
+                        "control listen collides with the forward listen; use different ports"
+                            .into(),
+                    ));
+                }
             }
         }
 
@@ -1125,12 +1167,27 @@ fn validate_ratchet(raw: RawRatchet) -> Result<crate::ratchet::RatchetConfig, Co
 
 impl ControlConfig {
     fn validate(raw: RawControl) -> Result<ControlConfig, ConfigError> {
-        let listen: SocketAddr = raw
-            .listen
-            .as_deref()
-            .unwrap_or("127.0.0.1:9090")
-            .parse()
-            .map_err(|e| ConfigError::Control(format!("listen: {e}")))?;
+        let socket = raw
+            .socket
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+
+        // A `socket` with no explicit `listen` means *only* the socket. Naming
+        // the attested transport and silently also opening an unattestable TCP
+        // port would hand back exactly what the socket was chosen to avoid.
+        let listen: Option<SocketAddr> = match (&raw.listen, &socket) {
+            (Some(addr), _) => Some(
+                addr.parse()
+                    .map_err(|e| ConfigError::Control(format!("listen: {e}")))?,
+            ),
+            (None, Some(_)) => None,
+            (None, None) => Some(
+                "127.0.0.1:9090"
+                    .parse()
+                    .expect("the default control address parses"),
+            ),
+        };
+
         let ttl = duration(raw.ttl, DEFAULT_TICKET_TTL, "ttl", ConfigError::Control)?;
         let max_ttl = duration(
             raw.max_ttl,
@@ -1141,10 +1198,69 @@ impl ControlConfig {
         if max_ttl < ttl {
             return Err(ConfigError::Control("max_ttl must be at least ttl".into()));
         }
+
+        let mut allow_binary = Vec::with_capacity(raw.allow_binary.len());
+        for entry in &raw.allow_binary {
+            let entry = entry.trim();
+            // Deliberately a leading-slash test rather than `Path::is_absolute`,
+            // which asks the *host* platform. Attestation only exists over a Unix
+            // socket, so these are always compared against a path a Unix kernel
+            // reported — and `is_absolute` would call `/usr/local/bin/agent`
+            // relative when the parser happens to be running on Windows.
+            if !entry.starts_with('/') {
+                // A relative path is compared against the absolute one the kernel
+                // reports, so it would never match — a control that silently
+                // admits nobody, which is worse than one that admits everybody
+                // because it looks like it is working.
+                return Err(ConfigError::Control(format!(
+                    "allow_binary {entry:?} must be an absolute path — the peer's program is \
+                     always reported as one, so a relative entry could never match"
+                )));
+            }
+            allow_binary.push(std::path::PathBuf::from(entry));
+        }
+
+        let mut allow_sha256 = Vec::with_capacity(raw.allow_sha256.len());
+        for entry in &raw.allow_sha256 {
+            let digest = entry.trim().to_ascii_lowercase();
+            if digest.len() != 64 || !digest.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(ConfigError::Control(format!(
+                    "allow_sha256 {entry:?} is not a 64-character hex SHA-256 — a mistyped digest \
+                     is a rule that never matches anything"
+                )));
+            }
+            allow_sha256.push(digest);
+        }
+
+        let attests = !allow_binary.is_empty() || !allow_sha256.is_empty();
+        let scopes_uid = raw.allow_uid.is_some();
+        if (attests || scopes_uid) && socket.is_none() {
+            // Peer credentials do not exist on a TCP connection, loopback or
+            // not. Accepting this config would enforce nothing while reading
+            // like it enforces something.
+            return Err(ConfigError::Control(
+                "allow_uid / allow_binary / allow_sha256 need [control] socket — a TCP listener \
+                 carries no peer credentials, so there is nothing to attest"
+                    .into(),
+            ));
+        }
+        if socket.is_some() && cfg!(windows) {
+            return Err(ConfigError::Control(
+                "[control] socket is not supported on Windows yet — named-pipe peer identity is \
+                 not implemented, and degrading to the token alone would be a quieter control \
+                 than the one you asked for"
+                    .into(),
+            ));
+        }
+
         Ok(ControlConfig {
             listen,
+            socket,
             ttl,
             max_ttl,
+            allow_uid: raw.allow_uid,
+            allow_binary,
+            allow_sha256,
         })
     }
 }
@@ -1376,6 +1492,108 @@ mod tests {
         assert!(c.policy.signers.is_empty());
         assert!(c.secrets.refresh_interval.is_none());
         assert!(c.control.is_none());
+    }
+
+    /// Unix-only: `[control] socket` is refused outright on Windows (see
+    /// `a_control_socket_is_refused_on_windows`), so a test that needs one to
+    /// parse can only run where the transport exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_control_socket_replaces_the_tcp_listener_rather_than_joining_it() {
+        // Naming the attested transport and quietly also opening an unattestable
+        // TCP port would hand back exactly what the socket was chosen to avoid.
+        let c = cfg("[control]\nsocket='/run/seekrit/control.sock'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        let control = c.control.expect("a [control] block");
+        assert_eq!(control.socket.as_deref(), Some("/run/seekrit/control.sock"));
+        assert!(control.listen.is_none(), "no TCP port unless asked for");
+
+        // Asking for both is allowed, and startup warns about the TCP half.
+        let both = cfg("[control]\nsocket='/run/s.sock'\nlisten='127.0.0.1:9091'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        let both = both.control.unwrap();
+        assert!(both.socket.is_some() && both.listen.is_some());
+    }
+
+    #[test]
+    fn attestation_rules_require_a_socket() {
+        // A TCP connection carries no peer credentials, so accepting this would
+        // enforce nothing while reading like it enforces something.
+        for block in [
+            "[control]\nallow_binary=['/usr/local/bin/orchestrator']\n",
+            "[control]\nallow_sha256=['{}']\n"
+                .replace("{}", &"a".repeat(64))
+                .as_str(),
+            "[control]\nallow_uid=[501]\n",
+        ] {
+            let bad = err(&format!(
+                "{block}[[route]]\nprefix='/x'\nupstream='https://x.test'\n"
+            ));
+            assert!(bad.contains("socket"), "{bad}");
+            assert!(bad.contains("peer credentials"), "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_relative_allow_binary_is_refused() {
+        // The peer's program is always reported as an absolute path, so a
+        // relative entry could never match — a control that silently admits
+        // nobody, which is worse than one that admits everybody because it looks
+        // like it is working.
+        let bad = err(
+            "[control]\nsocket='/run/s.sock'\nallow_binary=['orchestrator']\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n",
+        );
+        assert!(bad.contains("absolute path"), "{bad}");
+    }
+
+    #[test]
+    fn a_mistyped_digest_is_refused_rather_than_never_matching() {
+        let bad = err("[control]\nsocket='/run/s.sock'\nallow_sha256=['abc123']\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(bad.contains("64-character hex"), "{bad}");
+    }
+
+    /// Unix-only: `[control] socket` is refused outright on Windows (see
+    /// `a_control_socket_is_refused_on_windows`), so a test that needs one to
+    /// parse can only run where the transport exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_digest_is_normalized_to_lowercase() {
+        let c = cfg(&format!(
+            "[control]\nsocket='/run/s.sock'\nallow_sha256=['{}']\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n",
+            "AB".repeat(32)
+        ));
+        let control = c.control.unwrap();
+        assert_eq!(control.allow_sha256, vec!["ab".repeat(32)]);
+        assert!(control.attests_binary());
+    }
+
+    /// Unix-only: `[control] socket` is refused outright on Windows (see
+    /// `a_control_socket_is_refused_on_windows`), so a test that needs one to
+    /// parse can only run where the transport exists.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_without_allow_rules_attests_only_the_user() {
+        let c = cfg("[control]\nsocket='/run/s.sock'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        let control = c.control.unwrap();
+        assert!(!control.attests_binary());
+        // `None` means "the proxy's own uid", substituted at startup so parsing
+        // stays pure.
+        assert!(control.allow_uid.is_none());
+    }
+
+    /// The counterpart to the `#[cfg(unix)]` socket tests above: on Windows the
+    /// config is refused at startup rather than quietly downgrading to the token
+    /// alone, which would be a weaker control than the one the operator asked for.
+    #[cfg(windows)]
+    #[test]
+    fn a_control_socket_is_refused_on_windows() {
+        let bad = err("[control]\nsocket='/run/seekrit/control.sock'\n\
+             [[route]]\nprefix='/x'\nupstream='https://x.test'\n");
+        assert!(bad.contains("not supported on Windows"), "{bad}");
     }
 
     #[test]
@@ -1962,7 +2180,7 @@ mod tests {
     fn control_listener_defaults_and_port_collisions() {
         let c = cfg("[[route]]\nprefix='/x'\nupstream='https://x.test'\n[control]\n");
         let control = c.control.expect("control");
-        assert_eq!(control.listen.to_string(), "127.0.0.1:9090");
+        assert_eq!(control.listen.unwrap().to_string(), "127.0.0.1:9090");
         assert_eq!(control.ttl, DEFAULT_TICKET_TTL);
         assert_eq!(control.max_ttl, DEFAULT_TICKET_MAX_TTL);
 
