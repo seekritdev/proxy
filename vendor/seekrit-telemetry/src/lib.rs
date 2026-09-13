@@ -1,6 +1,6 @@
 //! Shared OpenTelemetry wiring for the seekrit services that run on **your**
 //! infrastructure: `seekrit-run`, `seekrit-proxy`, `seekrit-provisioner`,
-//! `seekrit-sdk-server`, and `seekrit-kms`.
+//! `seekrit-sdk-server`, `seekrit-kms`, and `seekrit-nomad-secrets`.
 //!
 //! These are the components a customer operates themselves, so their telemetry
 //! belongs in the customer's own stack — not seekrit's. Everything here speaks
@@ -173,6 +173,16 @@ pub mod attr {
     pub const PROVISION_COMMAND: &str = "seekrit.provision.command";
     /// Whether `seekrit-run` fell back to `.env` + live environment only.
     pub const RUN_DEGRADED: &str = "seekrit.run.degraded";
+    /// Node-side credential profile a Nomad fetch selected. An operator-chosen
+    /// profile *name* from the client's own config — never a credential.
+    pub const SECRET_PROFILE: &str = "seekrit.profile";
+    /// Nomad namespace the calling job runs in (`NOMAD_NAMESPACE`).
+    pub const NOMAD_NAMESPACE: &str = "seekrit.nomad.namespace";
+    /// Nomad job id the fetch was made for (`NOMAD_JOB_ID`).
+    pub const NOMAD_JOB_ID: &str = "seekrit.nomad.job_id";
+    /// Whether a resolve was served from the last-known-good cache because the
+    /// API was unreachable. A boolean about availability, not about content.
+    pub const RESOLVE_FROM_CACHE: &str = "seekrit.resolve.from_cache";
     /// Machine-readable failure kind. Never a message containing user data.
     pub const ERROR_KIND: &str = "error.type";
 }
