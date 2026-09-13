@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.11.0](https://github.com/mileszim/seekrit/compare/proxy-v0.10.2...proxy-v0.11.0) (2026-09-13)
+
+
+### Features
+
+* **proxy:** hold declared operations for an operator's approval ([#387](https://github.com/mileszim/seekrit/issues/387)) ([3030c6b](https://github.com/mileszim/seekrit/commit/3030c6b673b87ea365b4392dbd36d96c1d5b702b))
+* **proxy:** refuse egress to private and link-local addresses ([#386](https://github.com/mileszim/seekrit/issues/386)) ([a8f9fb8](https://github.com/mileszim/seekrit/commit/a8f9fb8552c32082a02a94ca44397b2c3feb0469))
+* **proxy:** scrub injected credentials out of upstream responses ([#384](https://github.com/mileszim/seekrit/issues/384)) ([ffb5728](https://github.com/mileszim/seekrit/commit/ffb5728bf88adc48735f89d11ccc33f7482b1211))
+
 ## [0.10.2](https://github.com/mileszim/seekrit/compare/proxy-v0.10.1...proxy-v0.10.2) (2026-09-09)
 
 
