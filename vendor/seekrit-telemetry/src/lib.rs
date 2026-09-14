@@ -180,6 +180,14 @@ pub mod attr {
     pub const NOMAD_NAMESPACE: &str = "seekrit.nomad.namespace";
     /// Nomad job id the fetch was made for (`NOMAD_JOB_ID`).
     pub const NOMAD_JOB_ID: &str = "seekrit.nomad.job_id";
+    /// Account key that signed a wasmCloud entity's JWT (`iss`). The trust
+    /// anchor a profile pins — a public key, never a credential.
+    pub const WASMCLOUD_ISSUER: &str = "seekrit.wasmcloud.issuer";
+    /// wasmCloud component or provider public key the request came from (`sub`).
+    pub const WASMCLOUD_ENTITY: &str = "seekrit.wasmcloud.entity";
+    /// wadm application name a wasmCloud secret request declared. Unsigned
+    /// metadata, recorded because it is what an operator correlates against.
+    pub const WASMCLOUD_APPLICATION: &str = "seekrit.wasmcloud.application";
     /// Whether a resolve was served from the last-known-good cache because the
     /// API was unreachable. A boolean about availability, not about content.
     pub const RESOLVE_FROM_CACHE: &str = "seekrit.resolve.from_cache";
