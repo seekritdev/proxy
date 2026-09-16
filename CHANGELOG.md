@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.1](https://github.com/mileszim/seekrit/compare/proxy-v0.12.0...proxy-v0.12.1) (2026-09-16)
+
+
+### Dependencies
+
+* **deps:** bump the rust group across 2 directories with 3 updates ([#421](https://github.com/mileszim/seekrit/issues/421)) ([d21b7bf](https://github.com/mileszim/seekrit/commit/d21b7bf407b54c92c0552ad713d290712528111a))
+* **deps:** bump time from 0.3.36 to 0.3.55 in /apps/proxy ([#406](https://github.com/mileszim/seekrit/issues/406)) ([a4d8441](https://github.com/mileszim/seekrit/commit/a4d8441d934cbc4e130ef6dce09a87519db7ca28))
+
 ## [0.12.0](https://github.com/mileszim/seekrit/compare/proxy-v0.11.0...proxy-v0.12.0) (2026-09-13)
 
 
