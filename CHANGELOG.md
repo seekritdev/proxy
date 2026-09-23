@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.2](https://github.com/mileszim/seekrit/compare/proxy-v0.12.1...proxy-v0.12.2) (2026-09-23)
+
+
+### Dependencies
+
+* **deps:** bump aes-gcm from 0.10.3 to 0.11.1 in /crates/seekrit-core ([#454](https://github.com/mileszim/seekrit/issues/454)) ([827555e](https://github.com/mileszim/seekrit/commit/827555ea0bdbd5ac84b0be0634182bbec2e220c4))
+* **deps:** bump rcgen from 0.13.2 to 0.14.10 in /apps/proxy ([#452](https://github.com/mileszim/seekrit/issues/452)) ([abe1d4b](https://github.com/mileszim/seekrit/commit/abe1d4b00c87cb10d493d3c0a6a3c17489c84db0))
+* **deps:** bump the rust group across 2 directories with 1 update ([#451](https://github.com/mileszim/seekrit/issues/451)) ([2e555b7](https://github.com/mileszim/seekrit/commit/2e555b7a1233e4687750c4283457c12f4e92987b))
+
 ## [0.12.1](https://github.com/mileszim/seekrit/compare/proxy-v0.12.0...proxy-v0.12.1) (2026-09-16)
 
 
