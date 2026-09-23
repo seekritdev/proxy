@@ -76,7 +76,7 @@ futures-util = "0.3"
 bytes = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-rcgen = "0.13"
+rcgen = "0.14"
 
 # Config (TOML) + resolve response deserialization.
 serde = { version = "1", features = ["derive"] }

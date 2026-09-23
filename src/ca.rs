@@ -14,8 +14,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    KeyPair, KeyUsagePurpose,
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -41,8 +41,7 @@ impl std::error::Error for CaError {}
 
 /// The interception CA plus a cache of per-host TLS server configs.
 pub struct Ca {
-    cert: Certificate,
-    key: KeyPair,
+    issuer: Issuer<'static, KeyPair>,
     cert_pem: String,
     /// host → a rustls `ServerConfig` presenting that host's minted leaf.
     cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
@@ -66,20 +65,16 @@ impl Ca {
         let cert_pem =
             std::fs::read_to_string(cert_path).map_err(|e| CaError::Io(e.to_string()))?;
         let key = KeyPair::from_pem(&key_pem).map_err(|e| CaError::Cert(e.to_string()))?;
-        // Rebuild the issuer certificate from the persisted key + the same fixed
-        // CA parameters. Same key + subject ⇒ leaves signed by it chain to the
-        // on-disk CA the operator already trusts, so we don't need to parse the
-        // stored X.509 (no x509-parser dependency). `cert_pem` from disk is the
-        // one the operator installed; keep it for display.
-        let cert = ca_params()?
-            .self_signed(&key)
-            .map_err(|e| CaError::Cert(e.to_string()))?;
-        Ok(Ca::new(cert, key, cert_pem))
+        // Rebuild the issuer from the persisted key and fixed CA parameters.
+        // Same key and subject let leaves chain to the on-disk CA the operator
+        // already trusts, without parsing its X.509 certificate.
+        Ok(Ca::new(Issuer::new(ca_params()?, key), cert_pem))
     }
 
     fn generate(cert_path: &str, key_path: &str) -> Result<Ca, CaError> {
         let key = KeyPair::generate().map_err(|e| CaError::Cert(e.to_string()))?;
-        let cert = ca_params()?
+        let params = ca_params()?;
+        let cert = params
             .self_signed(&key)
             .map_err(|e| CaError::Cert(e.to_string()))?;
         let cert_pem = cert.pem();
@@ -87,13 +82,12 @@ impl Ca {
         std::fs::write(cert_path, &cert_pem).map_err(|e| CaError::Io(e.to_string()))?;
         write_private(key_path, &key.serialize_pem())?;
 
-        Ok(Ca::new(cert, key, cert_pem))
+        Ok(Ca::new(Issuer::new(params, key), cert_pem))
     }
 
-    fn new(cert: Certificate, key: KeyPair, cert_pem: String) -> Ca {
+    fn new(issuer: Issuer<'static, KeyPair>, cert_pem: String) -> Ca {
         Ca {
-            cert,
-            key,
+            issuer,
             cert_pem,
             cache: Mutex::new(HashMap::new()),
         }
@@ -131,7 +125,7 @@ impl Ca {
 
         let leaf_key = KeyPair::generate().map_err(|e| CaError::Cert(e.to_string()))?;
         let leaf = params
-            .signed_by(&leaf_key, &self.cert, &self.key)
+            .signed_by(&leaf_key, &self.issuer)
             .map_err(|e| CaError::Cert(e.to_string()))?;
 
         let cert_chain: Vec<CertificateDer<'static>> = vec![leaf.der().clone()];
