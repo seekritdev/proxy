@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.12.3](https://github.com/mileszim/seekrit/compare/proxy-v0.12.2...proxy-v0.12.3) (2026-09-30)
+
+
+### Dependencies
+
+* **deps:** bump hyper-util ([#488](https://github.com/mileszim/seekrit/issues/488)) ([9aa98f0](https://github.com/mileszim/seekrit/commit/9aa98f0b903d090b9327b4274fefd11247363748))
+* **telemetry:** upgrade exporters and the OpenTelemetry 0.33 stack ([#484](https://github.com/mileszim/seekrit/issues/484)) ([ae2fe9e](https://github.com/mileszim/seekrit/commit/ae2fe9e487b5bc830a973d9c1c10309f25569d94))
+* **telemetry:** upgrade HTTP and the OpenTelemetry 0.33 stack ([#482](https://github.com/mileszim/seekrit/issues/482)) ([41453e0](https://github.com/mileszim/seekrit/commit/41453e0db28e345ffc357a2b729877efbdb7149f))
+* **telemetry:** upgrade logging and the OpenTelemetry 0.33 stack ([#483](https://github.com/mileszim/seekrit/issues/483)) ([b4cd34a](https://github.com/mileszim/seekrit/commit/b4cd34a5be2c6b6753b5e9e55ec166ed0134b4fe))
+* **telemetry:** upgrade tracing and the OpenTelemetry 0.33 stack ([#485](https://github.com/mileszim/seekrit/issues/485)) ([823ec4b](https://github.com/mileszim/seekrit/commit/823ec4b3c61a772cf3c36da41da32e9ebd3a9a3c))
+
 ## [0.12.2](https://github.com/mileszim/seekrit/compare/proxy-v0.12.1...proxy-v0.12.2) (2026-09-23)
 
 
