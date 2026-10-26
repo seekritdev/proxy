@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.6](https://github.com/mileszim/seekrit/compare/proxy-v0.12.5...proxy-v0.12.6) (2026-10-26)
+
+
+### Dependencies
+
+* **deps:** bump the rust group across 9 directories with 4 updates ([#520](https://github.com/mileszim/seekrit/issues/520)) ([606ac96](https://github.com/mileszim/seekrit/commit/606ac9658ee7d4404e36deecc516013722c18693))
+* **deps:** bump the rust-telemetry group across 1 directory with 4 updates ([#519](https://github.com/mileszim/seekrit/issues/519)) ([bdb6508](https://github.com/mileszim/seekrit/commit/bdb650811a5434b6e932615ec4738860a47f75b5))
+
 ## [0.12.5](https://github.com/mileszim/seekrit/compare/proxy-v0.12.4...proxy-v0.12.5) (2026-10-15)
 
 
