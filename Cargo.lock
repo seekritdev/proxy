@@ -1655,7 +1655,7 @@ dependencies = [
 
 [[package]]
 name = "seekrit-proxy"
-version = "0.12.6"
+version = "0.12.7"
 dependencies = [
  "arc-swap",
  "axum",

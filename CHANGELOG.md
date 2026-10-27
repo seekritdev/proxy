@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.12.7](https://github.com/mileszim/seekrit/compare/proxy-v0.12.6...proxy-v0.12.7) (2026-10-27)
+
+
+### Dependencies
+
+* **deps:** bump opentelemetry-otlp ([#536](https://github.com/mileszim/seekrit/issues/536)) ([0643b16](https://github.com/mileszim/seekrit/commit/0643b16d245e56bd820cf28555f54b7cfa6ad380))
+* **deps:** bump the rust group across 5 directories with 5 updates ([#537](https://github.com/mileszim/seekrit/issues/537)) ([c26572b](https://github.com/mileszim/seekrit/commit/c26572bb5c5e085cfc971deaf20581295f7f38ae))
+
 ## [0.12.6](https://github.com/mileszim/seekrit/compare/proxy-v0.12.5...proxy-v0.12.6) (2026-10-26)
 
 
