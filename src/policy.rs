@@ -249,7 +249,10 @@ pub async fn fetch(
         api_url.trim_end_matches('/'),
         urlencode(agent)
     );
-    let mut req = client.get(&url).bearer_auth(token);
+    let mut req = client.get(&url).bearer_auth(
+        seekrit_core::crypto::service_token_auth(token)
+            .map_err(|e| PolicyError::Refused(e.to_string()))?,
+    );
     if let Some(etag) = etag {
         req = req.header(reqwest::header::IF_NONE_MATCH, etag);
     }

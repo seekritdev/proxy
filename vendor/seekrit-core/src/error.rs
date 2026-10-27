@@ -5,7 +5,7 @@ use std::fmt;
 
 #[derive(Debug)]
 pub enum CoreError {
-    /// The token string is not a well-formed `skt_<id>_<pkcs8>` value.
+    /// The token string is not a well-formed service-token bundle or auth credential.
     MalformedToken(String),
     /// A DEK could not be unwrapped, or a secret failed to decrypt (wrong key,
     /// tampered data, or mismatched context). Never leaks plaintext.

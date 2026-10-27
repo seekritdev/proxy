@@ -199,6 +199,13 @@ async fn flush_once(
     token: &str,
     policy_version: Option<u32>,
 ) {
+    let token = match seekrit_core::crypto::service_token_auth(token) {
+        Ok(auth) => auth,
+        Err(_) => {
+            warn!("activity reporting requires a v2 service token");
+            return;
+        }
+    };
     if log.is_empty() {
         return;
     }

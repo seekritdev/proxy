@@ -671,10 +671,11 @@ async fn a_dispatched_task_narrows_the_run_and_is_introspected_once() {
     let api = spawn(
         Router::new().route(
             "/v1/tasks/introspect",
-            axum::routing::post(move |body: String| {
+            axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
                 let calls = api_calls.clone();
                 async move {
                     calls.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(headers["authorization"], format!("Bearer skt_test_v2.{}", "A".repeat(43)));
                     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
                     let token = parsed["token"].as_str().unwrap_or("");
                     let session = |slug: &str, scopes: serde_json::Value| {
@@ -728,7 +729,7 @@ async fn a_dispatched_task_narrows_the_run_and_is_introspected_once() {
     let tasks = TaskClient::new(
         reqwest::Client::new(),
         format!("http://{api}"),
-        "skt_test".to_string(),
+        format!("skt_test_v2.{}.privatekey", "A".repeat(43)),
         vec!["nova".to_string()],
         std::time::Duration::from_secs(60),
     );

@@ -70,7 +70,10 @@ pub async fn fetch_body(
 
     let resp = client
         .get(&url)
-        .bearer_auth(token)
+        .bearer_auth(
+            seekrit_core::crypto::service_token_auth(token)
+                .map_err(|e| ResolveFailure::Refused(e.to_string()))?,
+        )
         .header("accept", "application/json")
         .send()
         .await

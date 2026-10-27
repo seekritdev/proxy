@@ -1,5 +1,6 @@
 {
-  "token": "skt_6EYgmoh8LuiPPAbM0SaVtc_MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgra6e_i8D2dIWlz-43EVbrHz-g698-kxY22MCp95L7VGhRANCAATA4nkyQKLq4hD5YvzXLtNtKAK_g-H4LF260zk0bInSWMbDfx0vTTtOg0tRWoDYWbuIN0vb1YMZ5z13xH5aBsDx",
+  "token": "skt_6EYgmoh8LuiPPAbM0SaVtc_v2.bh8OFkiEBdTJM4MBX75AMCPsR2Arp1i32sg8Ej0Vw7o.MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgra6e_i8D2dIWlz-43EVbrHz-g698-kxY22MCp95L7VGhRANCAATA4nkyQKLq4hD5YvzXLtNtKAK_g-H4LF260zk0bInSWMbDfx0vTTtOg0tRWoDYWbuIN0vb1YMZ5z13xH5aBsDx",
+  "authToken": "skt_6EYgmoh8LuiPPAbM0SaVtc_v2.bh8OFkiEBdTJM4MBX75AMCPsR2Arp1i32sg8Ej0Vw7o",
   "tokenId": "skt_6EYgmoh8LuiPPAbM0SaVtc",
   "publicKeyJwk": "{\"key_ops\":[],\"ext\":true,\"kty\":\"EC\",\"x\":\"wOJ5MkCi6uIQ-WL81y7TbSgCv4Ph-CxdutM5NGyJ0lg\",\"y\":\"xsN_HS9NO06DS1FagNhZu4g3S9vVgxnnPXfEfloGwPE\",\"crv\":\"P-256\"}",
   "resolve": {

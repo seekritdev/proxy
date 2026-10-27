@@ -169,6 +169,11 @@ impl TaskClient {
     }
 
     async fn introspect(&self, presented: &str) -> Result<Session, TaskError> {
+        if !presented.starts_with(TASK_PREFIX) {
+            return Err(TaskError::Refused(
+                "expected a dispatched task token".into(),
+            ));
+        }
         let url = format!("{}/v1/tasks/introspect", self.api_url.trim_end_matches('/'));
         // The token goes in the body, never the URL — it is a credential, and a
         // URL ends up in logs and traces. Serialized by hand rather than with
@@ -178,7 +183,10 @@ impl TaskClient {
         let resp = self
             .client
             .post(&url)
-            .bearer_auth(&self.token)
+            .bearer_auth(
+                seekrit_core::crypto::service_token_auth(&self.token)
+                    .map_err(|e| TaskError::Unavailable(e.to_string()))?,
+            )
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header(reqwest::header::ACCEPT, "application/json")
             .body(body)

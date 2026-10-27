@@ -25,14 +25,42 @@ use crate::error::{CoreError, CoreResult};
 const WRAP_HKDF_INFO: &[u8] = b"seekrit/wrap-dek/v1";
 const TOKEN_PREFIX: &str = "skt_";
 
+/// Return only the independent v2 auth credential. Legacy tokens fail closed.
+/// Accept a full local bundle or an already stripped credential; never a key.
+pub fn service_token_auth(token: &str) -> CoreResult<&str> {
+    let invalid = || {
+        CoreError::MalformedToken(
+            "a v2 service token is required for API access; replace legacy tokens in the dashboard"
+                .into(),
+        )
+    };
+    let rest = token.strip_prefix("skt_").ok_or_else(invalid)?;
+    let (id, parts) = rest.split_once("_v2.").ok_or_else(invalid)?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        return Err(invalid());
+    }
+    let (auth, key) = match parts.split_once('.') {
+        Some((auth, key)) => (auth, Some(key)),
+        None => (parts, None),
+    };
+    let base64url = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    };
+    if auth.len() != 43 || !base64url(auth) || key.is_some_and(|k| !base64url(k)) {
+        return Err(invalid());
+    }
+    Ok(&token[..4 + id.len() + 4 + auth.len()])
+}
+
 /// The private half of a service token, recovered from the `skt_…` string.
 pub struct TokenKey {
     secret: SecretKey,
 }
 
 impl TokenKey {
-    /// Parse `skt_<id>_<pkcs8 base64url>`. Only the first two `_` are
-    /// separators — the base64url key segment may itself contain `_`.
+    /// Parse the private key from a v2 bundle, or a legacy token for offline use.
     pub fn parse(token: &str) -> CoreResult<TokenKey> {
         if !token.starts_with(TOKEN_PREFIX) {
             return Err(CoreError::MalformedToken("must start with skt_".into()));
@@ -42,7 +70,18 @@ impl TokenKey {
         let sep = rest
             .find('_')
             .ok_or_else(|| CoreError::MalformedToken("missing key segment".into()))?;
-        let key_b64 = &rest[sep + 1..];
+        let mut key_b64 = &rest[sep + 1..];
+        if key_b64.starts_with("v2.") {
+            service_token_auth(token)?;
+            key_b64 = key_b64
+                .strip_prefix("v2.")
+                .unwrap()
+                .split_once('.')
+                .ok_or_else(|| {
+                    CoreError::MalformedToken("auth credential has no private key".into())
+                })?
+                .1;
+        }
         if key_b64.is_empty() {
             return Err(CoreError::MalformedToken("empty key segment".into()));
         }
