@@ -17,7 +17,7 @@
 //! Regenerate the vectors after changing the format or the matcher; a diff in
 //! `canonical_body` is the signal that the wire format moved.
 
-use seekrit_core::policy::{verify_bundle, Decision};
+use seekrit_core::policy::{verify_bundle, Decision, Transport};
 use serde_json::Value;
 
 fn vectors() -> Value {
@@ -160,5 +160,111 @@ fn decisions_match_the_dashboard_simulator() {
         );
         // Sanity: only "allow" is permissive, whatever the reason string says.
         assert_eq!(verdict.allowed(), verdict.decision == Decision::Allow);
+    }
+}
+
+/// The scheme and port of one transport decision, or `None` for a destination
+/// the operator fixed.
+fn transport_of(case: &Value) -> Option<Transport> {
+    let t = case.get("transport").filter(|t| !t.is_null())?;
+    let port = t["port"].as_u64().expect("port") as u16;
+    Some(match t["scheme"].as_str().expect("scheme") {
+        "https" => Transport::https(port),
+        "http" => Transport::http(port),
+        other => panic!("unknown scheme {other}"),
+    })
+}
+
+#[test]
+fn v2_bundles_verify_and_v1_cannot_smuggle_ports() {
+    let v = vectors();
+    let pinned = pinned(&v);
+    let bundles = v["transport"]["bundles"]
+        .as_array()
+        .expect("transport.bundles");
+    assert!(bundles.len() >= 4);
+
+    for entry in bundles {
+        let label = entry["label"].as_str().unwrap_or("<unlabeled>");
+        let envelope = entry["envelope"].as_str().expect("envelope");
+        let verified = verify_bundle(envelope, &pinned);
+        if entry["verifies"].as_bool().unwrap_or(false) {
+            let bundle = verified.unwrap_or_else(|e| panic!("{label}: should verify, got {e}"));
+            assert_eq!(bundle.v as u64, entry["v"].as_u64().unwrap(), "{label}");
+            if let Some(count) = entry["rule_count"].as_u64() {
+                assert_eq!(bundle.rules.len() as u64, count, "{label}: rule count");
+            }
+            assert!(
+                bundle
+                    .check_context(None, None, bundle.expires_at - 1)
+                    .is_ok(),
+                "{label}: this build accepts v{}",
+                bundle.v
+            );
+            continue;
+        }
+        // Refused at verification or at the context check — either way, a
+        // bundle that means different things to different readers is not run.
+        let refusal = match verified {
+            Err(e) => e.to_string(),
+            Ok(bundle) => bundle
+                .check_context(None, None, bundle.expires_at - 1)
+                .expect_err(label)
+                .to_string(),
+        };
+        match entry["reject_reason"].as_str() {
+            Some("v1_with_ports") => {
+                assert!(refusal.contains("need a v2 bundle"), "{label}: {refusal}")
+            }
+            Some("invalid_port") => assert!(refusal.contains("port 0"), "{label}: {refusal}"),
+            Some("unsupported_version") => assert!(
+                refusal.contains("unsupported policy bundle version"),
+                "{label}: {refusal}"
+            ),
+            other => panic!("{label}: unknown reject_reason {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn transport_decisions_match_the_dashboard_simulator() {
+    let v = vectors();
+    let pinned = pinned(&v);
+    let primary = verify_bundle(v["bundles"][0]["envelope"].as_str().unwrap(), &pinned)
+        .expect("the v1 bundle verifies")
+        .rule_set();
+    let transport = verify_bundle(
+        v["transport"]["bundles"][0]["envelope"].as_str().unwrap(),
+        &pinned,
+    )
+    .expect("the v2 bundle verifies")
+    .rule_set();
+
+    let decisions = v["transport"]["decisions"].as_array().expect("decisions");
+    assert!(decisions
+        .iter()
+        .any(|c| c["decision"] == "port_not_allowed" && c["bundle"] == "primary"));
+    for case in decisions {
+        let rules = match case["bundle"].as_str() {
+            Some("primary") => &primary,
+            Some("transport") => &transport,
+            other => panic!("unknown bundle {other:?}"),
+        };
+        let host = case["host"].as_str().expect("host");
+        let method = case["method"].as_str().expect("method");
+        let path = case["path"].as_str().expect("path");
+        let secret = case["secret"].as_str();
+        let at = transport_of(case);
+        let verdict = rules.decide(host, at, method, path, secret);
+        assert_eq!(
+            verdict.decision.reason(),
+            case["decision"].as_str().unwrap(),
+            "{method} {host} over {at:?}{path} secret={secret:?}"
+        );
+        assert_eq!(
+            verdict.rule_index,
+            case["rule_index"].as_u64().map(|i| i as usize),
+            "{method} {host} over {at:?}{path}: the simulator and the proxy must name the same rule"
+        );
     }
 }

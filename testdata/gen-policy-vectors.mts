@@ -22,7 +22,8 @@ import {
   type AgentPolicyRule,
   canonicalizeAgentPolicy,
   evaluatePolicy,
-  POLICY_BUNDLE_VERSION,
+  type PolicyTransport,
+  policyBundleVersionFor,
   policySignerThumbprint,
   signAgentPolicy,
 } from "../../../packages/core/src/agent-policy.ts";
@@ -120,7 +121,7 @@ const QUERIES = [
 
 function draft(overrides: Partial<AgentPolicyDraft> = {}): AgentPolicyDraft {
   return {
-    v: POLICY_BUNDLE_VERSION,
+    v: policyBundleVersionFor(overrides.rules ?? RULES),
     org: "org_2fVectorOrg",
     agent: "agt_9cVectorAgent",
     agent_slug: "nova",
@@ -168,6 +169,84 @@ function forgeSignerKid(envelope: string, kid: string): string {
     ".",
   );
 }
+
+// ---------------------------------------------------------------------------
+// Transport (v2): which ports and schemes a rule covers.
+//
+// A section of its own rather than more entries in `bundles`/`decisions`: the
+// JS SDK verifies the bundles above and understands v1 only, so it must refuse
+// a v2 envelope (fail closed) rather than read it with the ports dropped — its
+// vector test asserts exactly that from here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Cases two implementations could plausibly disagree on: the default (no ports
+ * ⇒ HTTPS on 443 only), a second rule on the same host that only another port
+ * reaches, `http_ports` alone replacing the default rather than adding to it,
+ * duplicates and ordering inside a port list, and a mixed-case host.
+ */
+const TRANSPORT_RULES: AgentPolicyRule[] = [
+  rule({ host: "api.example.com", allow: ["API_KEY"], label: "public API, default transport" }),
+  rule({ host: "api.example.com", methods: ["GET"], https_ports: [8443], label: "admin, reads" }),
+  rule({ host: "registry.internal", http_ports: [5000], allow: ["REGISTRY_TOKEN"] }),
+  rule({ host: "Mixed.Internal", https_ports: [8443, 443, 8443], http_ports: [8080] }),
+];
+
+const https = (port: number): PolicyTransport => ({ scheme: "https", port });
+const http = (port: number): PolicyTransport => ({ scheme: "http", port });
+
+/** `bundle` names the rule set: the v2 one here, or the v1 primary above. */
+const TRANSPORT_QUERIES = [
+  { bundle: "transport", host: "api.example.com", transport: https(443), method: "POST", path: "/v1/x", secret: "API_KEY" },
+  { bundle: "transport", host: "api.example.com", transport: https(8443), method: "GET", path: "/admin", secret: "API_KEY" },
+  { bundle: "transport", host: "api.example.com", transport: https(8443), method: "POST", path: "/admin" },
+  { bundle: "transport", host: "api.example.com", transport: https(9000), method: "GET", path: "/" },
+  { bundle: "transport", host: "api.example.com", transport: http(80), method: "GET", path: "/", secret: "API_KEY" },
+  { bundle: "transport", host: "registry.internal", transport: http(5000), method: "PUT", path: "/v2/x", secret: "REGISTRY_TOKEN" },
+  { bundle: "transport", host: "registry.internal", transport: https(443), method: "GET", path: "/" },
+  { bundle: "transport", host: "mixed.internal", transport: https(8443), method: "GET", path: "/" },
+  { bundle: "transport", host: "mixed.internal", transport: http(8443), method: "GET", path: "/" },
+  { bundle: "transport", host: "mixed.internal", transport: http(8080), method: "GET", path: "/" },
+  // No transport: a destination the operator fixed, which no port rule narrows.
+  { bundle: "transport", host: "api.example.com", transport: null, method: "DELETE", path: "/" },
+  { bundle: "transport", host: "evil.example.com", transport: https(443), method: "GET", path: "/" },
+  // A v1 bundle means HTTPS on 443 — the finding these vectors exist for.
+  { bundle: "primary", host: "api.openai.com", transport: https(443), method: "POST", path: "/v1/chat/completions", secret: "OPENAI_API_KEY" },
+  { bundle: "primary", host: "api.openai.com", transport: https(8443), method: "POST", path: "/v1/chat/completions", secret: "OPENAI_API_KEY" },
+  { bundle: "primary", host: "hooks.slack.com", transport: http(80), method: "POST", path: "/services/T0/B0/xyz", secret: "SLACK_WEBHOOK_URL" },
+] as const;
+
+const transportDraft = draft({ rules: TRANSPORT_RULES, policy_version: 8 });
+const transportEnvelope = await signAgentPolicy(main.privateKey, main.jwk, transportDraft);
+
+/**
+ * Sign raw body bytes, bypassing the canonicalizer — the only way to build a
+ * bundle a correct publisher refuses to produce, which is what a verifier has
+ * to be tested against.
+ */
+async function signRaw(body: Record<string, unknown>): Promise<string> {
+  const bytes = new TextEncoder().encode(JSON.stringify(body));
+  const sig = new Uint8Array(
+    await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, main.privateKey, bytes),
+  );
+  return ["ap1", Buffer.from(bytes).toString("base64url"), Buffer.from(sig).toString("base64url")].join(".");
+}
+
+function bodyOf(envelope: string): Record<string, unknown> {
+  const [, body] = envelope.split(".") as [string, string, string];
+  return JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+}
+
+/** A correctly signed v1 body with a port list slipped into one rule. */
+const smuggled = bodyOf(primaryEnvelope) as { rules: Record<string, unknown>[] };
+(smuggled.rules[0] as Record<string, unknown>).https_ports = [8443];
+const smuggledEnvelope = await signRaw(smuggled);
+
+const zeroPort = bodyOf(transportEnvelope) as { rules: Record<string, unknown>[] };
+(zeroPort.rules[0] as Record<string, unknown>).https_ports = [0];
+const zeroPortEnvelope = await signRaw(zeroPort);
+
+const futureEnvelope = await signRaw({ ...bodyOf(transportEnvelope), v: 3 });
 
 const vectors = {
   note:
@@ -243,6 +322,57 @@ const vectors = {
     );
     return { ...query, decision: verdict.decision, rule_index: verdict.ruleIndex };
   }),
+  transport: {
+    note:
+      "v2 bundles and scheme/port decisions. A rule naming no ports covers HTTPS on 443 only; " +
+      "`transport: null` is a destination the operator fixed, which no port rule narrows. " +
+      "Readers that understand v1 only must refuse every v2 bundle here.",
+    bundles: [
+      {
+        label: "v2: rules that name ports, signed by a pinned signer",
+        envelope: transportEnvelope,
+        canonical_body: canonicalizeAgentPolicy({
+          ...transportDraft,
+          signer: { kid: main.kid, jwk: main.jwk },
+        }),
+        v: 2,
+        verifies: true,
+        rule_count: TRANSPORT_RULES.length,
+      },
+      {
+        label: "v1 carrying https_ports — a pre-v2 reader would ignore them and allow any port",
+        envelope: smuggledEnvelope,
+        v: 1,
+        verifies: false,
+        reject_reason: "v1_with_ports",
+      },
+      {
+        label: "v2 naming port 0",
+        envelope: zeroPortEnvelope,
+        v: 2,
+        verifies: false,
+        reject_reason: "invalid_port",
+      },
+      {
+        label: "a version from the future, correctly signed",
+        envelope: futureEnvelope,
+        v: 3,
+        verifies: false,
+        reject_reason: "unsupported_version",
+      },
+    ],
+    decisions: TRANSPORT_QUERIES.map((query) => {
+      const rules = query.bundle === "primary" ? RULES : TRANSPORT_RULES;
+      const verdict = evaluatePolicy(rules, {
+        host: query.host,
+        transport: query.transport ?? undefined,
+        method: query.method,
+        path: query.path,
+        secret: "secret" in query ? query.secret : undefined,
+      });
+      return { ...query, decision: verdict.decision, rule_index: verdict.ruleIndex };
+    }),
+  },
 };
 
 console.log(JSON.stringify(vectors, null, 2));
