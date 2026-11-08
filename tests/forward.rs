@@ -178,7 +178,9 @@ async fn http_forward_substitutes_matched_host() {
     let upstream = spawn_http_upstream(hits.clone()).await;
     let (ca, _pem) = temp_ca();
 
-    let cfg = "[forward]\nlisten='127.0.0.1:0'\nunmatched_host_policy='tunnel'\n[[forward.host]]\nmatch='echo.test'\nallow=['TEST_KEY']\n";
+    // Cleartext is opt-in per rule: a ruled host covers HTTPS on 443 and nothing
+    // else unless it lists more.
+    let cfg = "[forward]\nlisten='127.0.0.1:0'\nunmatched_host_policy='tunnel'\n[[forward.host]]\nmatch='echo.test'\nallow=['TEST_KEY']\nhttp_ports=[80]\n";
     let config = Config::from_toml(cfg).unwrap();
     // The proxy's own client resolves the fake hostname to the real upstream.
     let client = reqwest::Client::builder()
@@ -279,8 +281,13 @@ async fn https_mitm_substitutes_and_forwards() {
     let (upstream, upstream_cert_pem) = spawn_tls_upstream("upstream.test", hits.clone()).await;
     let (ca, ca_pem) = temp_ca();
 
-    let cfg = "[forward]\nlisten='127.0.0.1:0'\n[[forward.host]]\nmatch='upstream.test'\nallow=['TEST_KEY']\n";
-    let config = Config::from_toml(cfg).unwrap();
+    // The upstream listens on an ephemeral port, so the rule has to name it: a
+    // rule naming no ports covers 443 only.
+    let cfg = format!(
+        "[forward]\nlisten='127.0.0.1:0'\n[[forward.host]]\nmatch='upstream.test'\nallow=['TEST_KEY']\nhttps_ports=[{}]\n",
+        upstream.port()
+    );
+    let config = Config::from_toml(&cfg).unwrap();
     // Proxy's client trusts the upstream's cert and resolves its hostname.
     let proxy_client = reqwest::Client::builder()
         .add_root_certificate(reqwest::Certificate::from_pem(upstream_cert_pem.as_bytes()).unwrap())
@@ -342,8 +349,8 @@ async fn http_forward_enforces_operation_constraints_on_a_ruled_host() {
     // carries no credential — the shape an operator writes to let an agent browse
     // an API while only one operation may hold the key.
     let cfg = "[forward]\nlisten='127.0.0.1:0'\nunmatched_host_policy='tunnel'\n\
-               [[forward.host]]\nmatch='echo.test'\nmethods=['POST']\npaths=['/v1/thing']\nallow=['TEST_KEY']\n\
-               [[forward.host]]\nmatch='echo.test'\nmethods=['GET']\n";
+               [[forward.host]]\nmatch='echo.test'\nmethods=['POST']\npaths=['/v1/thing']\nallow=['TEST_KEY']\nhttp_ports=[80]\n\
+               [[forward.host]]\nmatch='echo.test'\nmethods=['GET']\nhttp_ports=[80]\n";
     let config = Config::from_toml(cfg).unwrap();
     let client = reqwest::Client::builder()
         .resolve("echo.test", upstream)
@@ -417,4 +424,145 @@ async fn http_forward_enforces_operation_constraints_on_a_ruled_host() {
     assert_eq!(bad_method.status(), 403);
 
     assert_eq!(hits.get(), 2, "only the two permitted requests got through");
+}
+
+/// File policy, no tickets, no extras — the state the port tests share.
+fn file_state(config: Config, client: reqwest::Client) -> ForwardState {
+    let (ca, _pem) = temp_ca();
+    ForwardState {
+        egress: Arc::new(seekrit_proxy::egress::Egress::from_config(&config)),
+        config: Arc::new(config),
+        store: Arc::new(ArcSwap::from_pointee(store())),
+        client,
+        ca: Arc::new(ca),
+        metrics: Arc::new(seekrit_proxy::telemetry::Metrics::new()),
+        policy: None,
+        sessions: Arc::new(seekrit_proxy::tasks::SessionResolver::new(None, None)),
+        ratchet: None,
+        activity: None,
+        approvals: None,
+    }
+}
+
+/// Send a bare `CONNECT` and return the proxy's whole reply.
+///
+/// reqwest reports a refused `CONNECT` as a connection error and drops the
+/// response, which would hide the one thing these tests are about: the reason.
+async fn raw_connect(proxy: SocketAddr, target: &str) -> String {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut tcp = tokio::net::TcpStream::connect(proxy).await.unwrap();
+    let request = format!("CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n");
+    tcp.write_all(request.as_bytes()).await.unwrap();
+    // A refused CONNECT is an ordinary keep-alive response and an accepted one
+    // leaves the tunnel open, so neither closes: read until the proxy has said
+    // something and then gone quiet.
+    let mut reply = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        match tokio::time::timeout(Duration::from_millis(200), tcp.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => reply.extend_from_slice(&chunk[..n]),
+            Ok(Err(e)) => panic!("reading the CONNECT reply: {e}"),
+            Err(_) if !reply.is_empty() => break,
+            Err(_) => assert!(
+                tokio::time::Instant::now() < deadline,
+                "the proxy never answered"
+            ),
+        }
+    }
+    String::from_utf8_lossy(&reply).to_string()
+}
+
+#[tokio::test]
+async fn connect_to_a_port_no_rule_names_is_refused() {
+    // The finding: a rule for a host used to cover every port on that name. This
+    // rule names no ports, so it covers HTTPS on 443 — and the agent dials the
+    // same name on another port, the shape of an admin listener beside an API.
+    let hits = Hits::default();
+    let (upstream, upstream_cert_pem) = spawn_tls_upstream("upstream.test", hits.clone()).await;
+    let cfg = "[forward]\nlisten='127.0.0.1:0'\nunmatched_host_policy='tunnel'\n\
+               [[forward.host]]\nmatch='upstream.test'\nallow=['TEST_KEY']\n";
+    let client = reqwest::Client::builder()
+        .add_root_certificate(reqwest::Certificate::from_pem(upstream_cert_pem.as_bytes()).unwrap())
+        .resolve("upstream.test", upstream)
+        .build()
+        .unwrap();
+    let proxy = spawn_forward(file_state(Config::from_toml(cfg).unwrap(), client)).await;
+
+    // Refused at CONNECT — not intercepted, and not blind-tunnelled even though
+    // `unmatched_host_policy = tunnel`: the host has rules, and a tunnel past
+    // them would make the port number the way around every one.
+    let reply = raw_connect(proxy, &format!("upstream.test:{}", upstream.port())).await;
+    assert!(reply.starts_with("HTTP/1.1 403"), "{reply}");
+    assert!(
+        reply.contains(&format!("https:{}", upstream.port())),
+        "the refusal names the port it refused: {reply}"
+    );
+    assert!(
+        reply.contains("https_ports"),
+        "and where the fix goes: {reply}"
+    );
+    assert_eq!(hits.get(), 0, "nothing reached the other port");
+
+    // The port the rule does cover is still intercepted as before.
+    let reply = raw_connect(proxy, "upstream.test:443").await;
+    assert!(reply.starts_with("HTTP/1.1 200"), "{reply}");
+}
+
+#[tokio::test]
+async fn cleartext_toward_a_ruled_host_is_refused_unless_listed() {
+    let hits = Hits::default();
+    let upstream = spawn_http_upstream(hits.clone()).await;
+    // Ruled for HTTPS only (the default), so `http://` would put the
+    // substituted credential on the wire unencrypted.
+    let cfg = format!(
+        "[forward]\nlisten='127.0.0.1:0'\nunmatched_host_policy='tunnel'\n\
+               [[forward.host]]\nmatch='echo.test'\nallow=['TEST_KEY']\n\
+               [[forward.host]]\nmatch='plain.test'\nallow=['TEST_KEY']\nhttp_ports=[{port}]\n",
+        port = upstream.port()
+    );
+    let client = reqwest::Client::builder()
+        .resolve("echo.test", upstream)
+        .resolve("plain.test", upstream)
+        .build()
+        .unwrap();
+    let proxy = spawn_forward(file_state(Config::from_toml(&cfg).unwrap(), client)).await;
+    let agent = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::http(format!("http://{proxy}")).unwrap())
+        .build()
+        .unwrap();
+
+    for url in [
+        "http://echo.test/v1/thing",
+        "http://echo.test:8080/v1/thing",
+    ] {
+        let resp = agent
+            .post(url)
+            .header("authorization", "Bearer {{seekrit:TEST_KEY}}")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{url}");
+        let body = resp.text().await.unwrap();
+        assert!(
+            body.contains("http:"),
+            "the refusal names the transport: {body}"
+        );
+    }
+    assert_eq!(hits.get(), 0, "no cleartext request left the proxy");
+
+    // A rule that lists a cleartext port gets exactly that port.
+    let listed = agent
+        .post(format!("http://plain.test:{}/v1/thing", upstream.port()))
+        .header("authorization", "Bearer {{seekrit:TEST_KEY}}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(listed.status(), 200);
+    assert_eq!(hits.received().0, "Bearer s3cr3t-value");
+    let unlisted = agent.get("http://plain.test:9090/x").send().await.unwrap();
+    assert_eq!(unlisted.status(), 403);
+    assert_eq!(hits.get(), 1);
 }

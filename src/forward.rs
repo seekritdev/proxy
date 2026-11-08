@@ -10,6 +10,12 @@
 //! - **HTTP** arrives as an absolute-form request (`GET http://host/…`). No TLS;
 //!   we substitute (for ruled hosts) and forward.
 //!
+//! A rule names a host *and* the ports on it — HTTPS on 443 unless it lists
+//! `https_ports` / `http_ports`. A ruled host on any other port (or over
+//! cleartext, unless listed) is refused, never intercepted and never
+//! blind-tunnelled: the same name on another port is another service, and
+//! letting it through would turn the port number into a way around the rule.
+//!
 //! Every destination on this plane is chosen by the agent, so it is also the
 //! plane that needs [`crate::egress`]: a rule permitting `evil.test` is a route
 //! to the instance-metadata service the moment that name resolves there. The
@@ -42,7 +48,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, info, warn};
 
-use seekrit_core::policy::Decision;
+use seekrit_core::policy::{Decision, Transport};
 
 use crate::activity::{ActivityLog, Cell};
 use crate::approval::{describe_refusal, ApprovalStore, Outcome};
@@ -112,6 +118,10 @@ impl ForwardState {
 enum ForwardReject {
     /// The operation is not permitted (method, path, or no rule for this host).
     Operation(Decision),
+    /// The host is ruled, but no rule covers the scheme and port the agent
+    /// dialled. Separate from `Operation` so the refusal can name them — "this
+    /// port" is useless in a log line that does not say which one.
+    Port(Transport),
     /// Policy is configured but unusable: expired, or an unknown ticket/identity.
     NoPolicy(String),
     /// Withdrawn earlier in this run by the trust ratchet. Distinct from
@@ -123,6 +133,7 @@ impl ForwardReject {
     fn into_response(self, state: &ForwardState) -> Response<Body> {
         let (reason, message) = match self {
             ForwardReject::Operation(d) => (d.reason(), describe_operation(d)),
+            ForwardReject::Port(t) => (Decision::PortNotAllowed.reason(), describe_port(t)),
             ForwardReject::NoPolicy(m) => ("policy_unavailable", m),
             ForwardReject::Ratchet(m) => ("ratchet_withdrawn", m),
         };
@@ -131,6 +142,14 @@ impl ForwardReject {
         state.metrics.record_request(PLANE_FORWARD, "denied");
         text(StatusCode::FORBIDDEN, &message)
     }
+}
+
+/// The 403 body for a scheme/port refusal: which one, and where the fix goes.
+fn describe_port(transport: Transport) -> String {
+    format!(
+        "no rule for this host permits {transport} — a rule covers HTTPS on 443 unless its \
+         https_ports / http_ports say otherwise"
+    )
 }
 
 impl ForwardState {
@@ -145,14 +164,28 @@ impl ForwardState {
         }
     }
 
+    /// Does any rule for this (ruled) host cover this scheme and port? Like
+    /// [`Self::intercepts`], decided from the union of every configured agent,
+    /// because a `CONNECT` carries no ticket; `authorize` then applies the
+    /// specific agent's rules per request and can still refuse.
+    fn permits_transport(&self, host: &str, transport: Transport) -> bool {
+        match (self.fwd().rules.as_ref(), self.policy.as_ref()) {
+            (Some(rules), _) => rules.permits_transport(host, transport),
+            (None, Some(policy)) => policy.permits_transport_any(host, transport),
+            (None, None) => false,
+        }
+    }
+
     /// Authorize one request on a ruled host, yielding the injection gate.
     ///
-    /// Both planes ask the same question through the same evaluator; the only
-    /// difference is that here the path is the whole request path (there is no
-    /// route prefix to strip).
+    /// Both planes ask the same question through the same evaluator; the
+    /// differences are that here the path is the whole request path (there is no
+    /// route prefix to strip), and the scheme and port are the agent's choice, so
+    /// they are part of the question.
     async fn authorize(
         &self,
         host: &str,
+        transport: Transport,
         method: &Method,
         path: &str,
         headers: &HeaderMap,
@@ -203,19 +236,22 @@ impl ForwardState {
             (None, None) => return Err(ForwardReject::NoPolicy("no policy is loaded".into())),
         };
 
-        let rule = match rules.find(host, method.as_str(), path) {
+        let rule = match rules.find(host, Some(transport), method.as_str(), path) {
             Some((index, rule)) => {
                 tracing::Span::current().record(seekrit_telemetry::attr::POLICY_RULE, index as i64);
                 rule
             }
             None => {
-                let verdict = rules.evaluate(host, method.as_str(), path);
+                let verdict = rules.evaluate(host, Some(transport), method.as_str(), path);
                 self.note(
                     host,
                     method.as_str(),
                     verdict.decision.reason(),
                     verdict.rule_index,
                 );
+                if verdict.decision == Decision::PortNotAllowed {
+                    return Err(ForwardReject::Port(transport));
+                }
                 return Err(ForwardReject::Operation(verdict.decision));
             }
         };
@@ -325,6 +361,18 @@ fn handle_connect(req: Request<Incoming>, state: ForwardState) -> Response<Body>
 
     let is_ruled = state.intercepts(&host);
     if is_ruled {
+        // A ruled host is ruled on the ports its rules name, not on every port
+        // that answers to the name: `api.example.com:8443` is a different
+        // service from `:443`, often an admin one. Refused here, with a reason,
+        // rather than intercepted — a port that does not speak TLS would only
+        // fail the handshake, and one that does would be refused per request
+        // anyway. Never blind-tunnelled either: the host has rules, and a tunnel
+        // past them would make the port the way around every one.
+        let transport = Transport::https(port);
+        if !state.permits_transport(&host, transport) {
+            state.note(&host, "CONNECT", Decision::PortNotAllowed.reason(), None);
+            return ForwardReject::Port(transport).into_response(&state);
+        }
         // MITM: on upgrade, terminate TLS with a minted cert and serve.
         let st = state.clone();
         let host_c = host.clone();
@@ -430,7 +478,13 @@ async fn mitm_forward(
     // session ticket this request carries.
     let path = pq.split('?').next().unwrap_or("/");
     let gate = match state
-        .authorize(host.as_str(), &parts.method, path, &parts.headers)
+        .authorize(
+            host.as_str(),
+            Transport::https(port),
+            &parts.method,
+            path,
+            &parts.headers,
+        )
         .await
     {
         Ok(gate) => gate,
@@ -492,6 +546,10 @@ async fn handle_absolute_http(req: Request<Incoming>, state: ForwardState) -> Re
         None => host.clone(),
     };
     let base_url = format!("http://{authority}");
+    // Cleartext, so the port is only half of it: a ruled host reached over
+    // `http://` puts whatever is substituted on the wire unencrypted, which is
+    // why a rule covers no cleartext port unless it lists one in `http_ports`.
+    let transport = Transport::http(uri.port_u16().unwrap_or(80));
     let pq = uri
         .path_and_query()
         .map(|p| p.as_str().to_string())
@@ -501,7 +559,7 @@ async fn handle_absolute_http(req: Request<Incoming>, state: ForwardState) -> Re
     let gate: Option<Gate> = if state.intercepts(&host) {
         let path = pq.split('?').next().unwrap_or("/");
         match state
-            .authorize(&host, &parts.method, path, &parts.headers)
+            .authorize(&host, transport, &parts.method, path, &parts.headers)
             .await
         {
             Ok(gate) => Some(gate),

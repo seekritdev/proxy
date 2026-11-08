@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use seekrit_cache::{Cache, CacheKey, Lookup as CacheLookup};
-use seekrit_core::policy::{verify_bundle, Bundle, Rule, RuleSet};
+use seekrit_core::policy::{verify_bundle, Bundle, Rule, RuleSet, Transport};
 use tracing::{info, warn};
 
 use crate::config::{Config, PolicyConfig};
@@ -132,6 +132,15 @@ impl PolicyStore {
         self.slots
             .values()
             .any(|slot| slot.load().rules.covers_host(host))
+    }
+
+    /// True if *any* configured agent's policy covers this host on this scheme
+    /// and port — the `CONNECT`-time port check, from the union for the same
+    /// reason as [`Self::covers_host_any`].
+    pub fn permits_transport_any(&self, host: &str, transport: Transport) -> bool {
+        self.slots
+            .values()
+            .any(|slot| slot.load().rules.permits_transport(host, transport))
     }
 
     fn publish(&self, agent: &str, snapshot: PolicySnapshot) {

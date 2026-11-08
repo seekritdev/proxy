@@ -141,7 +141,9 @@ async fn a_hostname_resolving_to_loopback_is_refused() {
     // resolves this way, so the test needs no DNS fixture.
     let upstream = spawn(Router::new().fallback(any(|| async { "secrets" }))).await;
     let proxy = forward_proxy(&format!(
-        "{RULE_ANY}[[forward.host]]\nmatch='localhost'\nallow=['TEST_KEY']\n"
+        "{RULE_ANY}[[forward.host]]\nmatch='localhost'\nallow=['TEST_KEY']\n\
+         http_ports=[{port}]\n",
+        port = upstream.port()
     ))
     .await;
 
@@ -162,7 +164,9 @@ async fn allow_cidr_reopens_a_named_range() {
     let upstream = spawn(Router::new().fallback(any(|| async { "reachable" }))).await;
     let proxy = forward_proxy(&format!(
         "[egress]\nallow_cidr=['127.0.0.0/8']\n\
-         {RULE_ANY}[[forward.host]]\nmatch='localhost'\nallow=['TEST_KEY']\n"
+         {RULE_ANY}[[forward.host]]\nmatch='localhost'\nallow=['TEST_KEY']\n\
+         http_ports=[{port}]\n",
+        port = upstream.port()
     ))
     .await;
 
@@ -181,7 +185,9 @@ async fn turning_the_gate_off_reopens_everything() {
     let upstream = spawn(Router::new().fallback(any(|| async { "reachable" }))).await;
     let proxy = forward_proxy(&format!(
         "[egress]\nblock_private_ips=false\n\
-         {RULE_ANY}[[forward.host]]\nmatch='localhost'\nallow=['TEST_KEY']\n"
+         {RULE_ANY}[[forward.host]]\nmatch='localhost'\nallow=['TEST_KEY']\n\
+         http_ports=[{port}]\n",
+        port = upstream.port()
     ))
     .await;
 

@@ -179,9 +179,39 @@ checked in order, first match wins, so a narrow rule belongs above a broad one.
 
 Note the asymmetry: empty `methods`/`paths` mean **any**, empty `allow` means
 **none**. A rule with no `allow` permits an operation without letting a
-credential travel with it. Refusals name the constraint that decided (method,
-path, or no rule at all), because a default-deny policy otherwise fails in
-exactly the confusing direction.
+credential travel with it. Refusals name the constraint that decided (port,
+method, path, or no rule at all), because a default-deny policy otherwise fails
+in exactly the confusing direction.
+
+### Ports (forward mode)
+
+A `[[forward.host]]` rule names a host **and the ports on it**, and here absent
+does *not* mean any: a rule covers **HTTPS on 443** unless it lists
+`https_ports` and/or `http_ports`, and listing either replaces that default
+rather than adding to it.
+
+```toml
+[[forward.host]]
+match = "registry.internal"
+https_ports = [443, 8443]
+http_ports = [5000]        # cleartext: the substituted credential crosses the wire unencrypted
+allow = ["REGISTRY_TOKEN"]
+```
+
+The same name on another port is another service — often an admin listener —
+so a ruled host dialled on a port no rule names is refused at `CONNECT` with a
+`403` naming the port, and cleartext `http://` to a ruled host is refused
+unless the rule lists that port in `http_ports`. Neither is ever blind-tunnelled,
+even under `unmatched_host_policy = "tunnel"`: the host has rules, and a tunnel
+past them would make the port number the way around every one.
+
+Before this, a rule matched its host on every port and over cleartext. A config
+that relied on that — an internal service on a non-standard port, or plain
+`http://` — now needs the port listed.
+
+Ports bind the forward plane only. A `[[route]]` upstream already names its
+scheme and port in this file; the agent cannot pick another, so there is
+nothing for a port rule to narrow.
 
 ## Rules from the dashboard (`[policy] source = "server"`)
 

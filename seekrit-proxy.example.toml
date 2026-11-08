@@ -94,6 +94,17 @@ allow = ["EXAMPLE_API_KEY"]
 # methods = ["POST"]                  # optional; absent = any method
 # paths = ["/v1/**"]                  # optional; absent = any path
 #
+# # Ports are the one constraint where absent does NOT mean any: a rule covers
+# # HTTPS on 443 unless it says otherwise, because the same name on another
+# # port is another service (often an admin one), and cleartext puts the
+# # substituted credential on the wire. Listing either key replaces the
+# # default rather than adding to it. A ruled host on any other port, or over
+# # http:// without http_ports, is refused — never intercepted or tunnelled.
+# [[forward.host]]
+# match = "registry.internal"
+# https_ports = [443, 8443]          # optional; absent (with http_ports) = [443]
+# http_ports = [5000]                # optional; absent = no cleartext at all
+#
 # # Several rules may name one host — they are checked in order, first match
 # # wins, so a narrow rule belongs above a broad one:
 # [[forward.host]]

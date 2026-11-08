@@ -40,8 +40,21 @@ use crate::sign::VerifyingKey;
 /// seekrit blob: `ap1.<b64url(body)>.<b64url(signature)>`.
 pub const POLICY_PREFIX: &str = "ap1";
 
-/// The bundle schema version this build understands.
-pub const BUNDLE_VERSION: u32 = 1;
+/// The newest bundle schema version this build understands.
+///
+/// - **v1** — rules name a host, methods, paths, and secrets. A v1 rule carries
+///   no transport fields and means the default: HTTPS on 443 ([`PortSet`]).
+/// - **v2** — rules may also carry `https_ports` / `http_ports`.
+///
+/// A publisher emits v1 whenever every rule is on the default transport, so a
+/// proxy that predates v2 keeps working until someone actually needs a port.
+/// A bundle that does need one is v2, which such a proxy refuses outright
+/// (fail closed) rather than reading it with the port constraint silently
+/// dropped — the reason this is a version bump and not just a new field.
+pub const BUNDLE_VERSION: u32 = 2;
+
+/// The oldest bundle schema version this build still accepts.
+pub const MIN_BUNDLE_VERSION: u32 = 1;
 
 // ---------------------------------------------------------------------------
 // Rules and evaluation
@@ -195,11 +208,147 @@ fn match_segment(pattern: &str, segment: &str) -> bool {
     true
 }
 
+/// How a request reaches its upstream: TLS or cleartext.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Scheme {
+    Https,
+    Http,
+}
+
+impl Scheme {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scheme::Https => "https",
+            Scheme::Http => "http",
+        }
+    }
+}
+
+/// The scheme and port an agent dialled — the part of a destination a hostname
+/// does not name.
+///
+/// Only asked about where the agent chooses it (the forward plane). A
+/// reverse-proxy route's upstream, port included, is written in the operator's
+/// own file, which is why the evaluators take an `Option<Transport>` and why
+/// that plane passes `None` — the same exemption the proxy's egress gate
+/// (`apps/proxy/src/egress.rs`) makes for a configured upstream, for the same
+/// reason: the agent did not choose it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Transport {
+    pub scheme: Scheme,
+    pub port: u16,
+}
+
+impl Transport {
+    pub fn https(port: u16) -> Transport {
+        Transport {
+            scheme: Scheme::Https,
+            port,
+        }
+    }
+
+    pub fn http(port: u16) -> Transport {
+        Transport {
+            scheme: Scheme::Http,
+            port,
+        }
+    }
+}
+
+impl std::fmt::Display for Transport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.scheme.as_str(), self.port)
+    }
+}
+
+/// The port a rule permits when it names none: HTTPS on 443.
+pub const DEFAULT_HTTPS_PORT: u16 = 443;
+
+/// Which ports a rule covers, per scheme.
+///
+/// **Absent does not mean any here**, unlike [`MethodSet`] and [`PathSet`].
+/// A bare hostname reads as `https://host` — port 443, over TLS — and that is
+/// what a rule naming no ports permits. Anything else (another TLS port, or
+/// cleartext HTTP on any port) is opt-in, because a different port on the same
+/// name is a different service with different privileges, and cleartext puts the
+/// substituted credential on the wire. Before v2 bundles a rule matched every
+/// port on its host; this type is the fix for that.
+///
+/// The default applies only when *neither* list says anything: a rule that lists
+/// `http = [8080]` alone permits exactly that, not that plus 443.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortSet {
+    /// Ports reachable over TLS (a `CONNECT` the forward plane intercepts).
+    pub https: BTreeSet<u16>,
+    /// Ports reachable over cleartext HTTP (an absolute-form `http://` request).
+    pub http: BTreeSet<u16>,
+}
+
+impl Default for PortSet {
+    fn default() -> PortSet {
+        PortSet {
+            https: [DEFAULT_HTTPS_PORT].into_iter().collect(),
+            http: BTreeSet::new(),
+        }
+    }
+}
+
+impl PortSet {
+    /// Build from configured lists. Both empty ⇒ [`PortSet::default`].
+    ///
+    /// Port `0` is not filtered here — it never matches a real connection — so
+    /// that a list holding only `0` is not quietly reread as the default. The
+    /// config and bundle loaders refuse it outright.
+    pub fn new<A, B>(https: A, http: B) -> PortSet
+    where
+        A: IntoIterator<Item = u16>,
+        B: IntoIterator<Item = u16>,
+    {
+        let https: BTreeSet<u16> = https.into_iter().collect();
+        let http: BTreeSet<u16> = http.into_iter().collect();
+        if https.is_empty() && http.is_empty() {
+            PortSet::default()
+        } else {
+            PortSet { https, http }
+        }
+    }
+
+    pub fn permits(&self, transport: Transport) -> bool {
+        match transport.scheme {
+            Scheme::Https => self.https.contains(&transport.port),
+            Scheme::Http => self.http.contains(&transport.port),
+        }
+    }
+
+    /// True for HTTPS on 443 and nothing else — what a rule means when it says
+    /// nothing about ports, and what a v1 bundle can express.
+    pub fn is_default(&self) -> bool {
+        *self == PortSet::default()
+    }
+
+    /// `https:443,8443 http:8080` — for logs and refusals.
+    pub fn describe(&self) -> String {
+        let list =
+            |set: &BTreeSet<u16>| set.iter().map(u16::to_string).collect::<Vec<_>>().join(",");
+        let mut parts = Vec::new();
+        if !self.https.is_empty() {
+            parts.push(format!("https:{}", list(&self.https)));
+        }
+        if !self.http.is_empty() {
+            parts.push(format!("http:{}", list(&self.http)));
+        }
+        parts.join(" ")
+    }
+}
+
 /// One upstream host and what an agent may do to it.
 #[derive(Debug, Clone)]
 pub struct Rule {
     /// Lowercased hostname, no port and no scheme.
     pub host: String,
+    /// Which schemes and ports on `host` this rule covers. Only consulted where
+    /// the agent chose the port (see [`Transport`]).
+    pub ports: PortSet,
     pub methods: MethodSet,
     pub paths: PathSet,
     /// Secret names injectable toward this host (default-deny: empty ⇒ none).
@@ -210,9 +359,11 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// A rule on the default transport (HTTPS on 443); see [`Rule::with_ports`].
     pub fn new(host: &str, methods: MethodSet, paths: PathSet, allow: BTreeSet<String>) -> Rule {
         Rule {
             host: host.trim().to_ascii_lowercase(),
+            ports: PortSet::default(),
             methods,
             paths,
             allow,
@@ -220,9 +371,20 @@ impl Rule {
         }
     }
 
+    pub fn with_ports(mut self, ports: PortSet) -> Rule {
+        self.ports = ports;
+        self
+    }
+
     /// True if this rule governs `method` + `path` on its host.
     pub fn covers(&self, method: &str, path: &str) -> bool {
         self.methods.matches(method) && self.paths.matches(path)
+    }
+
+    /// True if this rule covers how the request arrives. `None` is a destination
+    /// the operator fixed (a reverse-proxy route), which no port rule narrows.
+    pub fn reaches(&self, transport: Option<Transport>) -> bool {
+        transport.is_none_or(|t| self.ports.permits(t))
     }
 
     /// Decide one operation against this rule alone — the host is assumed to
@@ -256,6 +418,9 @@ pub enum Decision {
     Allow,
     /// No rule covers this host at all.
     NoRule,
+    /// Rules cover the host, but none on this scheme and port — `:8443`, say,
+    /// or cleartext `http://` toward a host only ruled for HTTPS.
+    PortNotAllowed,
     /// A rule covers the host and path, but not this method.
     MethodNotAllowed,
     /// A rule covers the host, but no rule's paths cover this path.
@@ -274,6 +439,7 @@ impl Decision {
         match self {
             Decision::Allow => "allow",
             Decision::NoRule => "no_rule",
+            Decision::PortNotAllowed => "port_not_allowed",
             Decision::MethodNotAllowed => "method_not_allowed",
             Decision::PathNotAllowed => "path_not_allowed",
             Decision::SecretNotAllowed => "secret_not_allowed",
@@ -333,26 +499,63 @@ impl RuleSet {
         self.rules.iter().any(|r| r.host == host)
     }
 
+    /// True if any rule naming this host covers this scheme and port.
+    ///
+    /// The forward plane asks this at `CONNECT`, before a request exists, so a
+    /// tunnel to a port no rule mentions is refused with a reason instead of
+    /// being intercepted and failing every request inside it — or, for a port
+    /// that does not even speak TLS, failing a handshake with no reason at all.
+    pub fn permits_transport(&self, host: &str, transport: Transport) -> bool {
+        let host = host.trim().to_ascii_lowercase();
+        self.rules
+            .iter()
+            .any(|r| r.host == host && r.ports.permits(transport))
+    }
+
     /// The first rule covering this operation, with its index.
-    pub fn find(&self, host: &str, method: &str, path: &str) -> Option<(usize, &Rule)> {
+    ///
+    /// `transport` is how the agent reached the host, or `None` where the
+    /// operator fixed the destination (see [`Transport`]).
+    pub fn find(
+        &self,
+        host: &str,
+        transport: Option<Transport>,
+        method: &str,
+        path: &str,
+    ) -> Option<(usize, &Rule)> {
         let host = host.trim().to_ascii_lowercase();
         self.rules
             .iter()
             .enumerate()
-            .find(|(_, r)| r.host == host && r.covers(method, path))
+            .find(|(_, r)| r.host == host && r.reaches(transport) && r.covers(method, path))
     }
 
     /// Decide an operation, ignoring secrets: is the agent allowed to make this
     /// request at all? This is the anti-misuse half of the allowlist.
-    pub fn evaluate(&self, host: &str, method: &str, path: &str) -> Verdict {
+    ///
+    /// A rule on another port is skipped exactly like a rule on another host —
+    /// a different port is a different service — but the refusal still says
+    /// the host was covered, so `:8443` reads as "wrong port", not "no rule".
+    pub fn evaluate(
+        &self,
+        host: &str,
+        transport: Option<Transport>,
+        method: &str,
+        path: &str,
+    ) -> Verdict {
         let host = host.trim().to_ascii_lowercase();
         let mut host_matched = false;
+        let mut port_matched = false;
         let mut path_matched_index: Option<usize> = None;
         for (i, rule) in self.rules.iter().enumerate() {
             if rule.host != host {
                 continue;
             }
             host_matched = true;
+            if !rule.reaches(transport) {
+                continue;
+            }
+            port_matched = true;
             let paths_ok = rule.paths.matches(path);
             if paths_ok && rule.methods.matches(method) {
                 return Verdict::of(Decision::Allow, Some(i));
@@ -364,18 +567,26 @@ impl RuleSet {
                 path_matched_index = Some(i);
             }
         }
-        match (host_matched, path_matched_index) {
-            (_, Some(i)) => Verdict::of(Decision::MethodNotAllowed, Some(i)),
-            (true, None) => Verdict::of(Decision::PathNotAllowed, None),
-            (false, None) => Verdict::of(Decision::NoRule, None),
+        match (host_matched, port_matched, path_matched_index) {
+            (_, _, Some(i)) => Verdict::of(Decision::MethodNotAllowed, Some(i)),
+            (true, true, None) => Verdict::of(Decision::PathNotAllowed, None),
+            (true, false, None) => Verdict::of(Decision::PortNotAllowed, None),
+            (false, _, None) => Verdict::of(Decision::NoRule, None),
         }
     }
 
     /// Decide an operation *and* whether `secret` may be injected into it — the
     /// exact question the proxy asks per placeholder and the simulator asks per
     /// dry run.
-    pub fn decide(&self, host: &str, method: &str, path: &str, secret: Option<&str>) -> Verdict {
-        let verdict = self.evaluate(host, method, path);
+    pub fn decide(
+        &self,
+        host: &str,
+        transport: Option<Transport>,
+        method: &str,
+        path: &str,
+        secret: Option<&str>,
+    ) -> Verdict {
+        let verdict = self.evaluate(host, transport, method, path);
         let (Some(index), Some(secret)) = (verdict.rule_index, secret) else {
             return verdict;
         };
@@ -485,8 +696,23 @@ pub struct BundleRule {
     pub paths: Vec<String>,
     #[serde(default)]
     pub allow: Vec<String>,
+    /// v2 only. TLS ports this rule covers; see [`PortSet`] for the default.
+    #[serde(default)]
+    pub https_ports: Option<Vec<u16>>,
+    /// v2 only. Cleartext HTTP ports this rule covers.
+    #[serde(default)]
+    pub http_ports: Option<Vec<u16>>,
     #[serde(default)]
     pub label: Option<String>,
+}
+
+impl BundleRule {
+    fn ports(&self) -> PortSet {
+        PortSet::new(
+            self.https_ports.iter().flatten().copied(),
+            self.http_ports.iter().flatten().copied(),
+        )
+    }
 }
 
 /// The publishing admin's key, carried inside the signature.
@@ -528,6 +754,7 @@ impl Bundle {
                 .iter()
                 .map(|r| Rule {
                     host: r.host.trim().to_ascii_lowercase(),
+                    ports: r.ports(),
                     methods: MethodSet::new(r.methods.clone()),
                     paths: PathSet::new(r.paths.clone()),
                     allow: r.allow.iter().cloned().collect(),
@@ -547,9 +774,10 @@ impl Bundle {
         agent: Option<&str>,
         now: i64,
     ) -> CoreResult<()> {
-        if self.v != BUNDLE_VERSION {
+        if !(MIN_BUNDLE_VERSION..=BUNDLE_VERSION).contains(&self.v) {
             return Err(CoreError::Policy(format!(
-                "unsupported policy bundle version {} (this build understands {BUNDLE_VERSION})",
+                "unsupported policy bundle version {} (this build understands \
+                 {MIN_BUNDLE_VERSION} through {BUNDLE_VERSION})",
                 self.v
             )));
         }
@@ -582,6 +810,40 @@ impl Bundle {
     /// Seconds until this bundle expires (0 once it has).
     pub fn seconds_remaining(&self, now: i64) -> i64 {
         (self.expires_at - now).max(0)
+    }
+
+    /// Refuse rules that a correct publisher cannot have produced.
+    ///
+    /// A v1 bundle carrying transport fields is the dangerous case: a proxy that
+    /// predates v2 ignores fields it does not know, so it would read the same
+    /// signed bytes as "any port" while this build reads them as a narrower
+    /// rule. Two enforcement points disagreeing on one signature is a bug
+    /// whichever way it falls, so such a bundle means nothing here either.
+    fn check_rules(&self) -> CoreResult<()> {
+        for (i, rule) in self.rules.iter().enumerate() {
+            let carries_ports = rule.https_ports.is_some() || rule.http_ports.is_some();
+            if self.v < 2 && carries_ports {
+                return Err(CoreError::Policy(format!(
+                    "policy bundle v{} rule {} carries https_ports/http_ports, which need a v2 bundle",
+                    self.v,
+                    i + 1
+                )));
+            }
+            let ports = rule
+                .https_ports
+                .iter()
+                .chain(rule.http_ports.iter())
+                .flatten();
+            for port in ports {
+                if *port == 0 {
+                    return Err(CoreError::Policy(format!(
+                        "policy bundle rule {} names port 0, which is not a port",
+                        i + 1
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -658,6 +920,9 @@ pub fn verify_bundle(envelope: &str, pinned: &[String]) -> CoreResult<Bundle> {
             "policy bundle signature is not valid for the pinned signer".into(),
         ));
     }
+    // After the signature, so a forgery is reported as one rather than as
+    // whatever shape its author happened to get wrong.
+    bundle.check_rules()?;
     Ok(bundle)
 }
 
@@ -723,7 +988,7 @@ mod tests {
     fn paths_are_case_sensitive_but_hosts_are_not() {
         assert!(!match_path("/v1/Models", "/v1/models"));
         let set = RuleSet::new(vec![rule("API.Test", &[], &[], &["KEY"])]);
-        assert!(set.evaluate("api.test", "GET", "/x").allowed());
+        assert!(set.evaluate("api.test", None, "GET", "/x").allowed());
     }
 
     #[test]
@@ -732,11 +997,17 @@ mod tests {
             rule("api.test", &["POST"], &["/v1/chat/**"], &["KEY"]),
             rule("api.test", &[], &[], &[]),
         ]);
-        let v = set.decide("api.test", "POST", "/v1/chat/completions", Some("KEY"));
+        let v = set.decide(
+            "api.test",
+            None,
+            "POST",
+            "/v1/chat/completions",
+            Some("KEY"),
+        );
         assert_eq!(v.decision, Decision::Allow);
         assert_eq!(v.rule_index, Some(0));
         // The broad rule still covers other operations — with no secrets.
-        let v = set.decide("api.test", "GET", "/v1/models", Some("KEY"));
+        let v = set.decide("api.test", None, "GET", "/v1/models", Some("KEY"));
         assert_eq!(v.decision, Decision::SecretNotAllowed);
         assert_eq!(v.rule_index, Some(1));
     }
@@ -750,24 +1021,186 @@ mod tests {
             &["KEY"],
         )]);
         assert_eq!(
-            set.evaluate("other.test", "POST", "/v1/chat/completions")
+            set.evaluate("other.test", None, "POST", "/v1/chat/completions")
                 .decision,
             Decision::NoRule
         );
         assert_eq!(
-            set.evaluate("api.test", "DELETE", "/v1/chat/completions")
+            set.evaluate("api.test", None, "DELETE", "/v1/chat/completions")
                 .decision,
             Decision::MethodNotAllowed
         );
         assert_eq!(
-            set.evaluate("api.test", "POST", "/v1/files").decision,
+            set.evaluate("api.test", None, "POST", "/v1/files").decision,
             Decision::PathNotAllowed
         );
         assert_eq!(
-            set.decide("api.test", "POST", "/v1/chat/completions", Some("OTHER"))
-                .decision,
+            set.decide(
+                "api.test",
+                None,
+                "POST",
+                "/v1/chat/completions",
+                Some("OTHER")
+            )
+            .decision,
             Decision::SecretNotAllowed
         );
+    }
+
+    #[test]
+    fn a_rule_naming_no_ports_means_https_on_443_only() {
+        let set = RuleSet::new(vec![rule("api.test", &[], &[], &["KEY"])]);
+        let ok = set.decide(
+            "api.test",
+            Some(Transport::https(443)),
+            "POST",
+            "/x",
+            Some("KEY"),
+        );
+        assert_eq!(ok.decision, Decision::Allow);
+        // The finding this type exists for: another port on the same name is a
+        // different service, and used to match.
+        for other in [Transport::https(8443), Transport::https(22)] {
+            assert_eq!(
+                set.decide("api.test", Some(other), "POST", "/x", Some("KEY"))
+                    .decision,
+                Decision::PortNotAllowed,
+                "{other}"
+            );
+        }
+        // Cleartext is opt-in too, including on the scheme's own default port.
+        assert_eq!(
+            set.evaluate("api.test", Some(Transport::http(80)), "GET", "/x")
+                .decision,
+            Decision::PortNotAllowed
+        );
+        // Where the operator fixed the destination, no port rule applies.
+        assert!(set.evaluate("api.test", None, "GET", "/x").allowed());
+    }
+
+    #[test]
+    fn listing_ports_replaces_the_default_rather_than_adding_to_it() {
+        let set = RuleSet::new(vec![
+            rule("svc.test", &[], &[], &["KEY"]).with_ports(PortSet::new([], [8080])),
+            rule("api.test", &[], &[], &["KEY"]).with_ports(PortSet::new([443, 8443], [])),
+        ]);
+        let http = Some(Transport::http(8080));
+        assert!(set.evaluate("svc.test", http, "GET", "/").allowed());
+        // `http = [8080]` alone does not also mean "and 443 over TLS".
+        assert_eq!(
+            set.evaluate("svc.test", Some(Transport::https(443)), "GET", "/")
+                .decision,
+            Decision::PortNotAllowed
+        );
+        // Nor does a TLS port open the same number in cleartext.
+        assert_eq!(
+            set.evaluate("api.test", Some(Transport::http(8443)), "GET", "/")
+                .decision,
+            Decision::PortNotAllowed
+        );
+        assert!(set
+            .evaluate("api.test", Some(Transport::https(8443)), "GET", "/")
+            .allowed());
+        assert!(set.permits_transport("API.test", Transport::https(8443)));
+        assert!(!set.permits_transport("api.test", Transport::https(9000)));
+        assert!(!set.permits_transport("other.test", Transport::https(443)));
+    }
+
+    #[test]
+    fn a_rule_on_another_port_is_skipped_like_a_rule_on_another_host() {
+        // First match wins, and a port mismatch means "not this rule": the
+        // broad 443 rule above must not answer for a request on 8443.
+        let set = RuleSet::new(vec![
+            rule("api.test", &[], &[], &["KEY"]),
+            rule("api.test", &["GET"], &[], &[]).with_ports(PortSet::new([8443], [])),
+        ]);
+        let alt = Some(Transport::https(8443));
+        let v = set.decide("api.test", alt, "GET", "/x", Some("KEY"));
+        assert_eq!(v.decision, Decision::SecretNotAllowed);
+        assert_eq!(v.rule_index, Some(1));
+        // A method near-miss on the reachable rule outranks the port refusal.
+        let v = set.evaluate("api.test", alt, "POST", "/x");
+        assert_eq!(v.decision, Decision::MethodNotAllowed);
+        assert_eq!(v.rule_index, Some(1));
+        assert_eq!(
+            set.find("api.test", alt, "GET", "/x").map(|(i, _)| i),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn port_sets_normalize_and_describe() {
+        assert!(PortSet::new([], []).is_default());
+        assert!(PortSet::new([443], []).is_default());
+        assert!(!PortSet::new([443], [80]).is_default());
+        assert_eq!(
+            PortSet::new([8443, 443], [80]).describe(),
+            "https:443,8443 http:80"
+        );
+        assert_eq!(PortSet::new([], [8080]).describe(), "http:8080");
+        // A list holding only 0 is not quietly reread as the default.
+        assert!(!PortSet::new([0], []).is_default());
+    }
+
+    fn bundle_with(v: u32, rule: BundleRule) -> Bundle {
+        Bundle {
+            v,
+            org: "org".into(),
+            agent: "agt".into(),
+            agent_slug: None,
+            policy_version: 1,
+            issued_at: 0,
+            expires_at: i64::MAX,
+            rules: vec![rule],
+            signer: Signer {
+                kid: String::new(),
+                jwk: SignerJwk {
+                    kty: "EC".into(),
+                    crv: "P-256".into(),
+                    x: String::new(),
+                    y: String::new(),
+                },
+            },
+        }
+    }
+
+    fn bundle_rule(https: Option<Vec<u16>>, http: Option<Vec<u16>>) -> BundleRule {
+        BundleRule {
+            host: "api.test".into(),
+            methods: vec![],
+            paths: vec![],
+            allow: vec!["KEY".into()],
+            https_ports: https,
+            http_ports: http,
+            label: None,
+        }
+    }
+
+    #[test]
+    fn transport_fields_need_a_v2_bundle() {
+        // A v1 bundle on the default transport is fine, and narrows to 443.
+        let v1 = bundle_with(1, bundle_rule(None, None));
+        assert!(v1.check_rules().is_ok());
+        assert!(v1.rule_set().rules[0].ports.is_default());
+        // A v1 bundle smuggling ports would mean "any port" to an older proxy.
+        let smuggled = bundle_with(1, bundle_rule(Some(vec![8443]), None));
+        let err = smuggled.check_rules().unwrap_err().to_string();
+        assert!(err.contains("need a v2 bundle"), "{err}");
+        // The same rule in v2 is exactly what v2 is for.
+        let v2 = bundle_with(2, bundle_rule(Some(vec![8443]), Some(vec![8080])));
+        assert!(v2.check_rules().is_ok());
+        assert_eq!(
+            v2.rule_set().rules[0].ports.describe(),
+            "https:8443 http:8080"
+        );
+        assert!(v2.check_context(None, None, 0).is_ok());
+        // Port 0 is refused rather than matched against nothing.
+        let zero = bundle_with(2, bundle_rule(Some(vec![0]), None));
+        assert!(zero.check_rules().is_err());
+        // And a version from the future is still refused.
+        assert!(bundle_with(3, bundle_rule(None, None))
+            .check_context(None, None, 0)
+            .is_err());
     }
 
     #[test]

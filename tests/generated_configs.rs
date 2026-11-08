@@ -103,7 +103,13 @@ fn the_openai_preset_permits_what_the_sdk_does_and_nothing_else() {
     // Permitted: the request the preset exists for, carrying its own credential.
     assert_eq!(
         rules
-            .decide(&route.host, "POST", upstream_path, Some("OPENAI_API_KEY"))
+            .decide(
+                &route.host,
+                None,
+                "POST",
+                upstream_path,
+                Some("OPENAI_API_KEY")
+            )
             .decision,
         Decision::Allow
     );
@@ -112,7 +118,7 @@ fn the_openai_preset_permits_what_the_sdk_does_and_nothing_else() {
     // reach an operation nobody granted.
     assert_eq!(
         rules
-            .decide(&route.host, "DELETE", "/v1/models/gpt-4", None)
+            .decide(&route.host, None, "DELETE", "/v1/models/gpt-4", None)
             .decision,
         Decision::MethodNotAllowed
     );
@@ -123,6 +129,7 @@ fn the_openai_preset_permits_what_the_sdk_does_and_nothing_else() {
         rules
             .decide(
                 &route.host,
+                None,
                 "POST",
                 upstream_path,
                 Some("ANTHROPIC_API_KEY")
@@ -145,6 +152,7 @@ fn the_openai_preset_permits_what_the_sdk_does_and_nothing_else() {
             .expect("file mode carries rules")
             .decide(
                 &anthropic.host,
+                None,
                 "POST",
                 anthropic.strip("/anthropic/v1/messages"),
                 Some("ANTHROPIC_API_KEY"),
@@ -170,6 +178,7 @@ fn a_generated_forward_config_declares_hosts_and_a_ca() {
         rules
             .decide(
                 "api.github.com",
+                None,
                 "POST",
                 "/repos/acme/app/issues",
                 Some("GITHUB_TOKEN")
@@ -181,7 +190,7 @@ fn a_generated_forward_config_declares_hosts_and_a_ca() {
     // A host with no rule is the `unmatched_host_policy` case, not an allow.
     assert_eq!(
         rules
-            .decide("evil.example", "POST", "/", Some("GITHUB_TOKEN"))
+            .decide("evil.example", None, "POST", "/", Some("GITHUB_TOKEN"))
             .decision,
         Decision::NoRule
     );

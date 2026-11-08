@@ -39,7 +39,7 @@ use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use seekrit_core::policy::{Ceiling, MethodSet, PathSet, Rule, RuleSet};
+use seekrit_core::policy::{Ceiling, MethodSet, PathSet, PortSet, Rule, RuleSet};
 use serde::Deserialize;
 
 /// 2 MiB — request bodies are buffered to substitute placeholders, so we cap
@@ -122,6 +122,13 @@ struct RawHostRule {
     /// Path patterns this host rule permits (full request path). Absent = any.
     #[serde(default)]
     paths: Vec<String>,
+    /// TLS ports this host rule covers. With `http_ports`, absent = 443 only —
+    /// *not* any port, unlike `methods`/`paths` (see `PortSet`).
+    #[serde(default)]
+    https_ports: Vec<u16>,
+    /// Cleartext `http://` ports this host rule covers. Absent = none.
+    #[serde(default)]
+    http_ports: Vec<u16>,
     #[serde(default)]
     label: Option<String>,
 }
@@ -1359,11 +1366,18 @@ impl ForwardConfig {
             }
             if host.contains('/') || host.contains(':') {
                 return Err(ConfigError::Forward(format!(
-                    "host {host:?} must be a bare hostname (no scheme, port, or path)"
+                    "host {host:?} must be a bare hostname (no scheme, port, or path); \
+                     put ports in https_ports / http_ports"
+                )));
+            }
+            if h.https_ports.contains(&0) || h.http_ports.contains(&0) {
+                return Err(ConfigError::Forward(format!(
+                    "host {host:?} names port 0, which is not a port"
                 )));
             }
             let (methods, paths) = operation(h.methods, h.paths, ConfigError::Forward)?;
-            let mut rule = Rule::new(&host, methods, paths, h.allow.into_iter().collect());
+            let mut rule = Rule::new(&host, methods, paths, h.allow.into_iter().collect())
+                .with_ports(PortSet::new(h.https_ports, h.http_ports));
             rule.label = h.label;
             rules.push(rule);
         }
@@ -1457,7 +1471,7 @@ impl Route {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seekrit_core::policy::Decision;
+    use seekrit_core::policy::{Decision, Transport};
 
     fn cfg(t: &str) -> Config {
         Config::from_toml(t).expect("valid config")
@@ -1832,7 +1846,7 @@ mod tests {
         let rules = route_rules(&c, "/x/anything");
         assert_eq!(
             rules
-                .decide("x.test", "DELETE", "/anything", Some("KEY"))
+                .decide("x.test", None, "DELETE", "/anything", Some("KEY"))
                 .decision,
             Decision::Allow
         );
@@ -1854,19 +1868,21 @@ mod tests {
         assert_eq!(stripped, "/v1/chat/completions");
         assert_eq!(
             rules
-                .decide(&route.host, "POST", stripped, Some("OPENAI_API_KEY"))
+                .decide(&route.host, None, "POST", stripped, Some("OPENAI_API_KEY"))
                 .decision,
             Decision::Allow
         );
         // Right path, wrong method.
         assert_eq!(
-            rules.decide(&route.host, "GET", stripped, None).decision,
+            rules
+                .decide(&route.host, None, "GET", stripped, None)
+                .decision,
             Decision::MethodNotAllowed
         );
         // Right method, path outside the pattern.
         assert_eq!(
             rules
-                .decide(&route.host, "POST", "/v1/files", None)
+                .decide(&route.host, None, "POST", "/v1/files", None)
                 .decision,
             Decision::PathNotAllowed
         );
@@ -1889,6 +1905,7 @@ mod tests {
             route_rules(&c, "/openai/v1/models")
                 .decide(
                     "api.openai.com",
+                    None,
                     "GET",
                     "/v1/models",
                     Some("OPENAI_API_KEY")
@@ -1900,6 +1917,7 @@ mod tests {
             route_rules(&c, "/openai-ro/v1/models")
                 .decide(
                     "api.openai.com",
+                    None,
                     "GET",
                     "/v1/models",
                     Some("OPENAI_API_KEY")
@@ -1943,6 +1961,7 @@ mod tests {
             rules
                 .decide(
                     "api.anthropic.com",
+                    None,
                     "POST",
                     "/v1/messages",
                     Some("ANTHROPIC_API_KEY")
@@ -1970,6 +1989,7 @@ mod tests {
             rules
                 .decide(
                     "api.github.com",
+                    None,
                     "POST",
                     "/repos/seekrit/issues",
                     Some("GITHUB_TOKEN")
@@ -1980,14 +2000,14 @@ mod tests {
         // The second rule covers other reads, but carries no credential.
         assert_eq!(
             rules
-                .decide("api.github.com", "GET", "/user", Some("GITHUB_TOKEN"))
+                .decide("api.github.com", None, "GET", "/user", Some("GITHUB_TOKEN"))
                 .decision,
             Decision::SecretNotAllowed
         );
         // And writes outside the issue paths are refused outright.
         assert_eq!(
             rules
-                .decide("api.github.com", "DELETE", "/repos/seekrit", None)
+                .decide("api.github.com", None, "DELETE", "/repos/seekrit", None)
                 .decision,
             Decision::MethodNotAllowed
         );
@@ -2007,6 +2027,57 @@ mod tests {
             Config::from_toml("[forward]\n[[forward.host]]\nmatch = 'https://api.test:443'\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn forward_host_ports_default_to_https_443_and_are_opt_in() {
+        let c = cfg("
+            [forward]
+            [[forward.host]]
+            match = 'api.test'
+            allow = ['KEY']
+            [[forward.host]]
+            match = 'registry.internal'
+            https_ports = [8443]
+            http_ports = [5000]
+        ");
+        let rules = c.forward.unwrap().rules.unwrap();
+        // No ports named: HTTPS on 443 and nothing else — not "any port".
+        assert!(rules.rules[0].ports.is_default());
+        assert!(rules.permits_transport("api.test", Transport::https(443)));
+        assert!(!rules.permits_transport("api.test", Transport::https(8443)));
+        assert!(!rules.permits_transport("api.test", Transport::http(80)));
+        // Named ports replace the default rather than adding to it.
+        assert_eq!(rules.rules[1].ports.describe(), "https:8443 http:5000");
+        assert!(!rules.permits_transport("registry.internal", Transport::https(443)));
+        assert_eq!(
+            rules
+                .decide(
+                    "api.test",
+                    Some(Transport::https(8443)),
+                    "GET",
+                    "/",
+                    Some("KEY")
+                )
+                .decision,
+            Decision::PortNotAllowed
+        );
+
+        // A port in the match is pointed at the keys that hold ports.
+        let err = Config::from_toml("[forward]\n[[forward.host]]\nmatch = 'api.test:8443'\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("https_ports"), "{err}");
+        // Port 0 is refused, not matched against nothing.
+        assert!(Config::from_toml(
+            "[forward]\n[[forward.host]]\nmatch = 'a.test'\nhttps_ports = [0]\n"
+        )
+        .is_err());
+        // And a port number that is not one fails to parse at all.
+        assert!(Config::from_toml(
+            "[forward]\n[[forward.host]]\nmatch = 'a.test'\nhttp_ports = [70000]\n"
+        )
+        .is_err());
     }
 
     #[test]

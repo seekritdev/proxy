@@ -339,13 +339,17 @@ async fn forward(state: AppState, req: Request, span: &tracing::Span) -> Result<
         (None, None) => return Err(Reject::NoPolicy("no policy is loaded".into())),
     };
 
-    let rule: &Rule = match rules.find(&route.host, method.as_str(), rest) {
+    // No transport: this route's upstream, port and scheme included, is written
+    // in the operator's file, not chosen by the agent, so a rule's
+    // `https_ports`/`http_ports` have nothing to narrow here. They bind the
+    // forward plane, where the agent dials whatever it likes.
+    let rule: &Rule = match rules.find(&route.host, None, method.as_str(), rest) {
         Some((index, rule)) => {
             span.record(seekrit_telemetry::attr::POLICY_RULE, index as i64);
             rule
         }
         None => {
-            let verdict = rules.evaluate(&route.host, method.as_str(), rest);
+            let verdict = rules.evaluate(&route.host, None, method.as_str(), rest);
             note(
                 &state,
                 &route.host,
@@ -397,7 +401,7 @@ async fn forward(state: AppState, req: Request, span: &tracing::Span) -> Result<
     let store = state.store.load_full();
     let store = store.as_ref();
     let rule_index = rules
-        .find(&route.host, method.as_str(), rest)
+        .find(&route.host, None, method.as_str(), rest)
         .map(|(i, _)| i);
     let activity = state.activity.clone();
     let cell = |decision: &'static str| Cell {
@@ -647,6 +651,9 @@ pub fn describe_operation(decision: Decision) -> String {
     match decision {
         Decision::Allow => "permitted".to_string(),
         Decision::NoRule => "no policy rule covers this upstream".to_string(),
+        Decision::PortNotAllowed => {
+            "this scheme or port is not permitted toward this upstream".to_string()
+        }
         Decision::MethodNotAllowed => {
             "this method is not permitted toward this upstream".to_string()
         }

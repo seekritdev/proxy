@@ -147,7 +147,7 @@ fn decisions_match_the_dashboard_simulator() {
         let secret = case["secret"].as_str();
         let want = case["decision"].as_str().expect("decision");
 
-        let verdict = rules.decide(host, method, path, secret);
+        let verdict = rules.decide(host, None, method, path, secret);
         assert_eq!(
             verdict.decision.reason(),
             want,
