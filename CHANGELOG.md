@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.15.0](https://github.com/mileszim/seekrit/compare/proxy-v0.14.0...proxy-v0.15.0) (2026-11-08)
+
+
+### Features
+
+* let agent policy rules name ports from the dashboard and CLI ([#561](https://github.com/mileszim/seekrit/issues/561)) ([42374f1](https://github.com/mileszim/seekrit/commit/42374f1ed7deea4afdfd9b00cbf61b0a292759d8))
+
 ## [0.14.0](https://github.com/mileszim/seekrit/compare/proxy-v0.13.0...proxy-v0.14.0) (2026-11-08)
 
 
