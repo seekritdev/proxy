@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.14.0](https://github.com/mileszim/seekrit/compare/proxy-v0.13.0...proxy-v0.14.0) (2026-11-08)
+
+
+### ⚠ BREAKING CHANGES
+
+* **proxy:** match forward-proxy rules on port and scheme, not host alone ([#560](https://github.com/mileszim/seekrit/issues/560))
+
+### Bug Fixes
+
+* **proxy:** match forward-proxy rules on port and scheme, not host alone ([#560](https://github.com/mileszim/seekrit/issues/560)) ([94ed0ac](https://github.com/mileszim/seekrit/commit/94ed0ac1a91e6a37711e8faaa07315064be9ac37))
+
 ## [0.13.0](https://github.com/mileszim/seekrit/compare/proxy-v0.12.7...proxy-v0.13.0) (2026-10-27)
 
 
