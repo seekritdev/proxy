@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1
+# syntax=mirror.gcr.io/docker/dockerfile:1
 #
 # seekrit-proxy — the egress proxy that swaps {{seekrit:NAME}} placeholders in a
 # workload's outbound requests for decrypted secrets. Multi-stage: build a fully-
@@ -30,7 +30,11 @@
 #       -p 8080:8080 seekritdev/proxy --listen 0.0.0.0:8080
 
 # ---- build stage: static musl binary ----------------------------------------
-FROM rust:1.97-alpine AS build
+# Docker Hub's official `rust` image, and the `# syntax=` frontend on line 1,
+# both pulled through Google's Docker Hub mirror: the same digests, without
+# Docker Hub's pull rate limit, which 429'd every build leg of a release that
+# fans out ~16 of these builds at once.
+FROM mirror.gcr.io/library/rust:1.97-alpine AS build
 
 # musl-dev + a C toolchain: needed to build `ring` (rustls'/rcgen's crypto backend).
 RUN apk add --no-cache musl-dev gcc make
