@@ -239,7 +239,7 @@
     ]
   },
   "substitution": {
-    "note": "Placeholder substitution over plaintext alone — no crypto involved. Every implementation of the engine (apps/proxy/src/substitute.rs and the fetch/httpx shims in the language SDKs) runs these, so the rules can never drift apart. The lookup each harness must install: a name in `denied` returns Denied, otherwise a name present in `values` returns that Value, otherwise Unknown. A case has either `expected` + `names`, or `error`.",
+    "note": "Placeholder substitution over plaintext alone — no crypto involved. Every implementation of the engine (apps/proxy/src/substitute.rs and the fetch/httpx shims in the language SDKs) runs these, so the rules can never drift apart. The lookup each harness must install: a name in `denied` returns Denied, otherwise a name present in `values` returns that Value, otherwise Unknown. A case has either `expected` + `names`, or `error`. A case with `header` is the value of that request header and runs through the header entry point (substitute_header / substituteHeader): an `Authorization` or `Proxy-Authorization` value (name compared case-insensitively) of the form `Basic <credentials>` — scheme case-insensitive, then one or more spaces, then canonical padded RFC 4648 base64 (standard alphabet, zero padding bits) that decodes to UTF-8 — has the decoded text substituted with the same lookup and re-encoded, keeping the scheme and spacing as sent. Any other value, including a Basic credential that fails one of those checks, is substituted as text exactly as a case without `header`.",
     "cases": [
       {
         "name": "substitutes a placeholder and reports the name",
@@ -429,6 +429,178 @@
         "names": [
           "EMPTY"
         ]
+      },
+      {
+        "name": "a placeholder inside a Basic credential is decoded, substituted, and re-encoded",
+        "header": "authorization",
+        "input": "Basic eC1hY2Nlc3MtdG9rZW46e3tzZWVrcml0OkdJVEhVQl9UT0tFTn19",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Basic eC1hY2Nlc3MtdG9rZW46Z2hwX2xpdmU=",
+        "names": [
+          "GITHUB_TOKEN"
+        ]
+      },
+      {
+        "name": "Proxy-Authorization carries a Basic credential too, re-encoded as UTF-8",
+        "header": "proxy-authorization",
+        "input": "Basic YWdlbnQ6e3tzZWVrcml0OlBST1hZX1BBU1NXT1JEfX0=",
+        "values": {
+          "PROXY_PASSWORD": "hünter2"
+        },
+        "denied": [],
+        "expected": "Basic YWdlbnQ6aMO8bnRlcjI=",
+        "names": [
+          "PROXY_PASSWORD"
+        ]
+      },
+      {
+        "name": "the header name and the Basic scheme match case-insensitively",
+        "header": "Authorization",
+        "input": "bAsIc e3tzZWVrcml0OkdJVEhVQl9UT0tFTn19Ongtb2F1dGgtYmFzaWM=",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "bAsIc Z2hwX2xpdmU6eC1vYXV0aC1iYXNpYw==",
+        "names": [
+          "GITHUB_TOKEN"
+        ]
+      },
+      {
+        "name": "every placeholder in a Basic credential is injected, and the spaces after the scheme are kept",
+        "header": "authorization",
+        "input": "Basic   e3tzZWVrcml0OkdIX1VTRVJ9fTp7e3NlZWtyaXQ6R0lUSFVCX1RPS0VOfX0=",
+        "values": {
+          "GH_USER": "octocat",
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Basic   b2N0b2NhdDpnaHBfbGl2ZQ==",
+        "names": [
+          "GH_USER",
+          "GITHUB_TOKEN"
+        ]
+      },
+      {
+        "name": "a denied name inside a Basic credential aborts the pass",
+        "header": "authorization",
+        "input": "Basic eC1hY2Nlc3MtdG9rZW46e3tzZWVrcml0OlNPTUVfT1RIRVJ9fQ==",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [
+          "SOME_OTHER"
+        ],
+        "error": {
+          "code": "denied",
+          "name": "SOME_OTHER"
+        }
+      },
+      {
+        "name": "an unresolved name inside a Basic credential aborts the pass",
+        "header": "authorization",
+        "input": "Basic eC1hY2Nlc3MtdG9rZW46e3tzZWVrcml0Ok1JU1NJTkd9fQ==",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "error": {
+          "code": "unresolved",
+          "name": "MISSING"
+        }
+      },
+      {
+        "name": "a Basic credential with no placeholder passes through byte-identical",
+        "header": "authorization",
+        "input": "Basic dXNlcjpwYXNz",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Basic dXNlcjpwYXNz",
+        "names": []
+      },
+      {
+        "name": "a placeholder standing in for the whole Basic credential is substituted as text",
+        "header": "authorization",
+        "input": "Basic {{seekrit:GITHUB_BASIC}}",
+        "values": {
+          "GITHUB_BASIC": "eC1hY2Nlc3MtdG9rZW46Z2hwX2xpdmU="
+        },
+        "denied": [],
+        "expected": "Basic eC1hY2Nlc3MtdG9rZW46Z2hwX2xpdmU=",
+        "names": [
+          "GITHUB_BASIC"
+        ]
+      },
+      {
+        "name": "a scheme other than Basic is not decoded",
+        "header": "authorization",
+        "input": "Bearer e3tzZWVrcml0OkdJVEhVQl9UT0tFTn19",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Bearer e3tzZWVrcml0OkdJVEhVQl9UT0tFTn19",
+        "names": []
+      },
+      {
+        "name": "a Basic credential in any other header is not decoded",
+        "header": "x-upstream-authorization",
+        "input": "Basic eC1hY2Nlc3MtdG9rZW46e3tzZWVrcml0OkdJVEhVQl9UT0tFTn19",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Basic eC1hY2Nlc3MtdG9rZW46e3tzZWVrcml0OkdJVEhVQl9UT0tFTn19",
+        "names": []
+      },
+      {
+        "name": "unpadded base64 is not decoded",
+        "header": "authorization",
+        "input": "Basic eDp7e3NlZWtyaXQ6R0lUSFVCX1RPS0VOfX0",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Basic eDp7e3NlZWtyaXQ6R0lUSFVCX1RPS0VOfX0",
+        "names": []
+      },
+      {
+        "name": "base64 with non-zero padding bits is not decoded",
+        "header": "authorization",
+        "input": "Basic eDp7e3NlZWtyaXQ6R0lUSFVCX1RPS0VOfX1=",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Basic eDp7e3NlZWtyaXQ6R0lUSFVCX1RPS0VOfX1=",
+        "names": []
+      },
+      {
+        "name": "the base64url alphabet is not decoded",
+        "header": "authorization",
+        "input": "Basic Y2l-Ont7c2Vla3JpdDpHSVRIVUJfVE9LRU59fQ==",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Basic Y2l-Ont7c2Vla3JpdDpHSVRIVUJfVE9LRU59fQ==",
+        "names": []
+      },
+      {
+        "name": "a Basic credential that does not decode to UTF-8 is not decoded",
+        "header": "authorization",
+        "input": "Basic /zp7e3NlZWtyaXQ6R0lUSFVCX1RPS0VOfX0=",
+        "values": {
+          "GITHUB_TOKEN": "ghp_live"
+        },
+        "denied": [],
+        "expected": "Basic /zp7e3NlZWtyaXQ6R0lUSFVCX1RPS0VOfX0=",
+        "names": []
       }
     ]
   }

@@ -83,6 +83,131 @@ pub fn substitute<F: Fn(&str) -> Lookup>(input: &[u8], lookup: &F) -> Result<Out
     Ok(Outcome { bytes: out, names })
 }
 
+/// Substitute inside one request header's value — [`substitute`], plus the one
+/// place a client encodes a placeholder before sending it.
+///
+/// git over HTTPS (and anything else speaking HTTP Basic) sends `user:password`
+/// base64-encoded, so `https://x-access-token:{{seekrit:GITHUB_TOKEN}}@github.com`
+/// leaves the client as `Authorization: Basic eC1hY2Nlc3Mt…` and the marker is
+/// invisible to a byte scan. For exactly that shape — an `Authorization` or
+/// `Proxy-Authorization` value of `Basic` (any case), one or more spaces, then
+/// canonical padded base64 that decodes to UTF-8 — the decoded text is run
+/// through the same `lookup` and re-encoded, keeping the scheme and spacing as
+/// sent. A denied or unknown name refuses exactly as it does anywhere else.
+///
+/// Every other value, a Basic credential failing any of those checks included,
+/// is substituted as plain text. That keeps a placeholder standing in for the
+/// whole credential (`Basic {{seekrit:GIT_BASIC}}`) working, and means no other
+/// header and no other scheme is ever base64-decoded: what looks like a token
+/// is not ours to interpret. The rules are pinned by the `header` cases of the
+/// shared substitution vectors.
+pub fn substitute_header<F: Fn(&str) -> Lookup>(
+    name: &str,
+    value: &[u8],
+    lookup: &F,
+) -> Result<Outcome, SubError> {
+    let Some((prefix, decoded)) = basic_credential(name, value) else {
+        return substitute(value, lookup);
+    };
+    let inner = substitute(decoded.as_bytes(), lookup)?;
+    if inner.names.is_empty() {
+        // Nothing injected: forward the credential exactly as it arrived.
+        return Ok(Outcome {
+            bytes: value.to_vec(),
+            names: inner.names,
+        });
+    }
+    let encoded = encode_base64(&inner.bytes);
+    let mut bytes = Vec::with_capacity(prefix.len() + encoded.len());
+    bytes.extend_from_slice(prefix);
+    bytes.extend_from_slice(encoded.as_bytes());
+    Ok(Outcome {
+        bytes,
+        names: inner.names,
+    })
+}
+
+/// `Some((scheme_and_spaces, decoded_text))` when `value` is a Basic credential
+/// in a header that carries one; `None` for anything to be scanned as text.
+fn basic_credential<'a>(name: &str, value: &'a [u8]) -> Option<(&'a [u8], String)> {
+    const SCHEME: &[u8] = b"basic";
+    if !name.eq_ignore_ascii_case("authorization")
+        && !name.eq_ignore_ascii_case("proxy-authorization")
+    {
+        return None;
+    }
+    if value.len() < SCHEME.len() || !value[..SCHEME.len()].eq_ignore_ascii_case(SCHEME) {
+        return None;
+    }
+    let spaces = value[SCHEME.len()..]
+        .iter()
+        .take_while(|&&b| b == b' ')
+        .count();
+    if spaces == 0 {
+        return None; // `Basicx…` is some other scheme
+    }
+    let split = SCHEME.len() + spaces;
+    let decoded = decode_canonical_base64(&value[split..])?;
+    let text = String::from_utf8(decoded).ok()?;
+    Some((&value[..split], text))
+}
+
+/// The standard base64 alphabet (RFC 4648 §4) — what HTTP Basic uses. Not
+/// `seekrit_core::b64`, which is base64url without padding, the blob encoding.
+const BASE64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// Standard base64 with `=` padding.
+fn encode_base64(input: &[u8]) -> String {
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(chunk.get(1).copied().unwrap_or(0)) << 8)
+            | u32::from(chunk.get(2).copied().unwrap_or(0));
+        out.push(BASE64[(n >> 18) as usize & 63] as char);
+        out.push(BASE64[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            BASE64[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            BASE64[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Decode standard base64 only if `input` is the *canonical* encoding of its
+/// bytes: non-empty, padded to a multiple of four, standard alphabet, zero
+/// padding bits. Checked by re-encoding, so every implementation of this rule
+/// can make the same check the same way. Lenient decoders accept far more
+/// (missing padding, the url-safe alphabet, stray bits), and each one is a
+/// different answer to "is this a credential?" — so anything else is not one.
+fn decode_canonical_base64(input: &[u8]) -> Option<Vec<u8>> {
+    if input.is_empty() || !input.len().is_multiple_of(4) {
+        return None;
+    }
+    let pad = input.iter().rev().take_while(|&&b| b == b'=').count();
+    if pad > 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    for &c in &input[..input.len() - pad] {
+        let v = BASE64.iter().position(|&a| a == c)? as u32;
+        acc = ((acc << 6) | v) & 0xFFFF;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    (encode_base64(&out).as_bytes() == input).then_some(out)
+}
+
 /// Placeholder names are env-var style: `[A-Za-z0-9_]+`.
 fn is_valid_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
@@ -162,5 +287,56 @@ mod tests {
         // Illegal char in name -> the opener is emitted literally, rest scanned.
         let (out2, _) = run("{{seekrit:bad-name}}").unwrap();
         assert_eq!(out2, "{{seekrit:bad-name}}");
+    }
+
+    #[test]
+    fn base64_matches_rfc_4648_test_vectors() {
+        for (plain, encoded) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(encode_base64(plain.as_bytes()), encoded);
+            if !encoded.is_empty() {
+                assert_eq!(
+                    decode_canonical_base64(encoded.as_bytes()).as_deref(),
+                    Some(plain.as_bytes())
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn non_canonical_base64_is_refused() {
+        for bad in [
+            "Zg",
+            "Zg=",
+            "Zh==",
+            "Z===",
+            "Zm9v====",
+            "Zm9v Yg==",
+            "Zm-v",
+            "Zg=a",
+        ] {
+            assert_eq!(decode_canonical_base64(bad.as_bytes()), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn basic_credential_substitutes_inside_and_re_encodes() {
+        let value = format!("Basic {}", encode_base64(b"u:{{seekrit:OPENAI_API_KEY}}"));
+        let out = substitute_header("authorization", value.as_bytes(), &lookup).unwrap();
+        assert_eq!(
+            String::from_utf8(out.bytes).unwrap(),
+            format!("Basic {}", encode_base64(b"u:sk-live"))
+        );
+        assert_eq!(
+            out.names.into_iter().collect::<Vec<_>>(),
+            ["OPENAI_API_KEY"]
+        );
     }
 }

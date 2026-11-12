@@ -57,7 +57,7 @@ use crate::policy::{now_secs, Gate, PolicyStore};
 use crate::proxy::describe_operation;
 use crate::ratchet::{RatchetStore, DEFAULT_SESSION};
 use crate::secrets::SecretStore;
-use crate::substitute::{substitute, Lookup, SubError};
+use crate::substitute::{substitute, substitute_header, Lookup, SubError};
 use crate::tasks::SessionResolver;
 use crate::telemetry::PLANE_FORWARD;
 use crate::tickets::{ticket_from_headers, TICKET_HEADER};
@@ -663,7 +663,7 @@ async fn inject_and_forward(
         let out = match gate {
             Some(gate) => {
                 let lookup = mk_lookup(gate, store);
-                match substitute(value.as_bytes(), &lookup) {
+                match substitute_header(name.as_str(), value.as_bytes(), &lookup) {
                     Ok(o) => {
                         injected.extend(o.names);
                         o.bytes

@@ -13,7 +13,7 @@
 
 use std::collections::BTreeSet;
 
-use seekrit_proxy::substitute::{substitute, Lookup, SubError};
+use seekrit_proxy::substitute::{substitute, substitute_header, Lookup, SubError};
 use serde_json::Value;
 
 fn cases() -> Vec<Value> {
@@ -55,12 +55,21 @@ fn lookup_for(case: &Value) -> impl Fn(&str) -> Lookup + '_ {
 fn every_substitution_vector_matches() {
     let cases = cases();
     assert!(!cases.is_empty(), "fixture carries substitution cases");
+    assert!(
+        cases.iter().any(|c| c.get("header").is_some()),
+        "fixture carries header (Basic credential) cases"
+    );
 
     for case in &cases {
         let name = case["name"].as_str().expect("case name");
         let input = case["input"].as_str().expect("case input");
         let lookup = lookup_for(case);
-        let result = substitute(input.as_bytes(), &lookup);
+        // A `header` case is that header's value, through the header entry point
+        // (which also sees inside an `Authorization: Basic` credential).
+        let result = match case.get("header").and_then(Value::as_str) {
+            Some(header) => substitute_header(header, input.as_bytes(), &lookup),
+            None => substitute(input.as_bytes(), &lookup),
+        };
 
         match case.get("error") {
             Some(expected) => {

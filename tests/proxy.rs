@@ -181,6 +181,44 @@ async fn denies_secret_not_on_allowlist_and_never_forwards() {
     assert_eq!(hits.count(), 0);
 }
 
+/// git over HTTPS: the client base64-encodes `user:password` into
+/// `Authorization: Basic`, so the placeholder only exists after decoding.
+#[tokio::test]
+async fn substitutes_inside_a_basic_credential() {
+    let (base, hits) = harness().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/up/repo.git/info/refs"))
+        .basic_auth("x-access-token", Some("{{seekrit:TEST_KEY}}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    // base64("x-access-token:s3cr3t-value")
+    assert_eq!(
+        hits.authorization(),
+        "Basic eC1hY2Nlc3MtdG9rZW46czNjcjN0LXZhbHVl"
+    );
+}
+
+#[tokio::test]
+async fn a_basic_credential_naming_a_denied_secret_never_forwards() {
+    let (base, hits) = harness().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base}/up/repo.git/info/refs"))
+        .basic_auth("x-access-token", Some("{{seekrit:NOT_ALLOWED}}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 403);
+    assert_eq!(hits.count(), 0);
+}
+
 #[tokio::test]
 async fn unmatched_path_is_404() {
     let (base, _hits) = harness().await;

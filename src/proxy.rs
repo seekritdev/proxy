@@ -37,7 +37,7 @@ use crate::config::Config;
 use crate::policy::{now_secs, Gate, PolicyStore};
 use crate::ratchet::{RatchetStore, DEFAULT_SESSION};
 use crate::secrets::SecretStore;
-use crate::substitute::{substitute, Lookup, SubError};
+use crate::substitute::{substitute, substitute_header, Lookup, SubError};
 use crate::tasks::SessionResolver;
 use crate::telemetry::{Metrics, PLANE_REVERSE};
 use crate::tickets::{ticket_from_headers, TICKET_HEADER};
@@ -463,7 +463,7 @@ async fn forward(state: AppState, req: Request, span: &tracing::Span) -> Result<
         if name.as_str().eq_ignore_ascii_case(TICKET_HEADER) {
             continue;
         }
-        let out = substitute(value.as_bytes(), &lookup)?;
+        let out = substitute_header(name.as_str(), value.as_bytes(), &lookup)?;
         injected.extend(out.names);
         let hv = HeaderValue::from_bytes(&out.bytes).map_err(|_| {
             Reject::BadRequest(format!("header {name} became invalid after substitution"))

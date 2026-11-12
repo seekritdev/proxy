@@ -35,7 +35,9 @@ upstream.
    API is unreachable, a layer won't decrypt, or the references don't resolve
    (a cycle), it refuses to start.
 2. **Per request.** Matches the path to a configured route, then substitutes
-   `{{seekrit:NAME}}` in the request **path, headers, and body**. Only the
+   `{{seekrit:NAME}}` in the request **path, headers, and body** — inside an
+   `Authorization: Basic` credential too, which is decoded, substituted, and
+   re-encoded so git over HTTPS works with a placeholder password. Only the
    request is rewritten; the response streams back untouched (so SSE / streaming
    APIs work).
 3. **Allowlist (default-deny).** Each route declares which secrets may be
