@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.16.1](https://github.com/mileszim/seekrit/compare/proxy-v0.16.0...proxy-v0.16.1) (2026-11-15)
+
+
+### Bug Fixes
+
+* restore wasm and proxy CI on Rust 1.100 ([#638](https://github.com/mileszim/seekrit/issues/638)) ([d51a5ab](https://github.com/mileszim/seekrit/commit/d51a5abef2d96291de79442c06810448b7bd8657))
+
 ## [0.16.0](https://github.com/mileszim/seekrit/compare/proxy-v0.15.0...proxy-v0.16.0) (2026-11-12)
 
 
