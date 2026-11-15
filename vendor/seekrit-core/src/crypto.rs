@@ -13,6 +13,7 @@ use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Nonce};
 use hkdf::Hkdf;
 use p256::ecdh::diffie_hellman;
+use p256::elliptic_curve::sec1::ToSec1Point;
 use p256::pkcs8::DecodePrivateKey;
 use p256::{PublicKey, SecretKey};
 use sha2::Sha256;
@@ -24,6 +25,57 @@ use crate::error::{CoreError, CoreResult};
 /// Must match `HKDF_INFO` in `packages/crypto/src/wrap.ts`.
 const WRAP_HKDF_INFO: &[u8] = b"seekrit/wrap-dek/v1";
 const TOKEN_PREFIX: &str = "skt_";
+
+/// Encrypt bytes directly to a requester's public P-256 JWK, matching wrapDek.
+/// No private recipient key or plaintext is sent to the control plane.
+pub fn wrap_to_public_key(plaintext: &[u8], recipient_jwk: &str) -> CoreResult<String> {
+    let jwk: serde_json::Value = serde_json::from_str(recipient_jwk)
+        .map_err(|_| CoreError::Crypto("invalid recipient public key".into()))?;
+    if jwk["kty"] != "EC" || jwk["crv"] != "P-256" || jwk.get("d").is_some() {
+        return Err(CoreError::Crypto("expected a public P-256 key".into()));
+    }
+    let coordinate = |name: &str| -> CoreResult<Vec<u8>> {
+        let value = jwk[name]
+            .as_str()
+            .ok_or_else(|| CoreError::Crypto("missing public coordinate".into()))?;
+        let bytes = b64::decode(value)
+            .map_err(|_| CoreError::Crypto("invalid public coordinate".into()))?;
+        if bytes.len() != 32 {
+            return Err(CoreError::Crypto("invalid public coordinate".into()));
+        }
+        Ok(bytes)
+    };
+    let mut point = vec![4];
+    point.extend(coordinate("x")?);
+    point.extend(coordinate("y")?);
+    let recipient = PublicKey::from_sec1_bytes(&point)
+        .map_err(|_| CoreError::Crypto("invalid recipient public key".into()))?;
+    let mut seed = Zeroizing::new([0u8; 32]);
+    let ephemeral = loop {
+        getrandom::fill(seed.as_mut())
+            .map_err(|_| CoreError::Crypto("secure RNG unavailable".into()))?;
+        if let Ok(key) = SecretKey::from_slice(seed.as_ref()) {
+            break key;
+        }
+    };
+    let shared = diffie_hellman(ephemeral.to_nonzero_scalar(), recipient.as_affine());
+    let mut salt = [0u8; 16];
+    let mut iv = [0u8; 12];
+    getrandom::fill(&mut salt).map_err(|_| CoreError::Crypto("secure RNG unavailable".into()))?;
+    getrandom::fill(&mut iv).map_err(|_| CoreError::Crypto("secure RNG unavailable".into()))?;
+    let hk = Hkdf::<Sha256>::new(Some(&salt), shared.raw_secret_bytes());
+    let mut wrapping = Zeroizing::new([0u8; 32]);
+    hk.expand(WRAP_HKDF_INFO, wrapping.as_mut())
+        .map_err(|_| CoreError::Crypto("key wrapping failed".into()))?;
+    let ciphertext = aes_gcm_encrypt(&wrapping, &iv, plaintext, &[])?;
+    Ok(format!(
+        "wd1.{}.{}.{}.{}",
+        b64::encode(ephemeral.public_key().to_sec1_point(false).as_bytes()),
+        b64::encode(&salt),
+        b64::encode(&iv),
+        b64::encode(&ciphertext)
+    ))
+}
 
 /// Return only the independent v2 auth credential. Legacy tokens fail closed.
 /// Accept a full local bundle or an already stripped credential; never a key.
@@ -57,6 +109,58 @@ pub fn service_token_auth(token: &str) -> CoreResult<&str> {
 /// The private half of a service token, recovered from the `skt_…` string.
 pub struct TokenKey {
     secret: SecretKey,
+}
+
+pub struct ProvisionerKeys {
+    pub decryption: TokenKey,
+    pub authentication: Zeroizing<Vec<u8>>,
+    pub authorization: Zeroizing<Vec<u8>>,
+    pub id: String,
+}
+
+/// Separate authentication from decryption even when deployment supplies only
+/// one root environment variable. The broker receives only the derived MAC key.
+pub fn provisioner_keys(root: &[u8]) -> CoreResult<ProvisionerKeys> {
+    use sha2::Digest;
+    if root.len() != 32 {
+        return Err(CoreError::Crypto(
+            "provisioner root must be 32 bytes".into(),
+        ));
+    }
+    let hk = Hkdf::<Sha256>::new(Some(&[]), root);
+    let mut scalar = Zeroizing::new([0u8; 32]);
+    hk.expand(b"seekrit/provisioner/decryption/v2", scalar.as_mut())
+        .map_err(|_| CoreError::Crypto("key derivation failed".into()))?;
+    let secret = SecretKey::from_slice(scalar.as_ref())
+        .map_err(|_| CoreError::Crypto("invalid provisioner root; generate another key".into()))?;
+    let mut authentication = Zeroizing::new(vec![0u8; 32]);
+    hk.expand(
+        b"seekrit/provisioner/authentication/v2",
+        authentication.as_mut(),
+    )
+    .map_err(|_| CoreError::Crypto("key derivation failed".into()))?;
+    let public = secret.public_key().to_sec1_point(false);
+    let mut authorization = Zeroizing::new(vec![0u8; 32]);
+    hk.expand(
+        b"seekrit/provisioner/authorization/v2",
+        authorization.as_mut(),
+    )
+    .map_err(|_| CoreError::Crypto("key derivation failed".into()))?;
+    let bytes = public.as_bytes();
+    let digest = Sha256::digest(
+        format!(
+            "{}.{}",
+            b64::encode(&bytes[1..33]),
+            b64::encode(&bytes[33..65])
+        )
+        .as_bytes(),
+    );
+    Ok(ProvisionerKeys {
+        decryption: TokenKey { secret },
+        authentication,
+        authorization,
+        id: format!("prv_{}", &b64::encode(digest.as_ref())[..32]),
+    })
 }
 
 impl TokenKey {
