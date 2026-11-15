@@ -958,9 +958,7 @@ fn text(status: StatusCode, msg: &str) -> Response<Body> {
 }
 
 fn full(bytes: Bytes) -> Body {
-    Full::new(bytes)
-        .map_err(|e| Box::new(e) as BoxError)
-        .boxed()
+    Full::new(bytes).map_err(|never| match never {}).boxed()
 }
 
 fn empty() -> Body {
